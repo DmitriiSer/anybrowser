@@ -1,0 +1,41 @@
+{
+  "name": "anybrowser",
+  "version": "0.0.0",
+  "description": "Let any LLM agent drive a real, logged-in browser over MCP. No browser extension required.",
+  "license": "MIT",
+  "repository": "github:DmitriiSer/anybrowser",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "browser",
+    "automation",
+    "playwright",
+    "agent",
+    "llm"
+  ],
+  "type": "module",
+  "bin": {
+    "anyb": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "prettier": "^3.9.8",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.1"
+  }
+}
