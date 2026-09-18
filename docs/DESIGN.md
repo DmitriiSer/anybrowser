@@ -33,12 +33,12 @@ The starting point was a small single-site fetch script: it existed because plai
 
 8. **Snapshot first, screenshot on demand.** The agent works from the accessibility snapshot with element refs. Screenshots and coordinate clicks (the `vision` capability) are the fallback for canvas pages and verification. The skill says so explicitly.
 
-9. **Embed `@playwright/mcp`, do not reimplement it.** `createConnection( config, contextGetter)` gives the full tool set per profile in-process, including the snapshot and ref engine. The router around it stays thin so a later swap to an own implementation is contained.
+9. **Embed `@playwright/mcp`, do not reimplement it.** `createConnection(config, contextGetter)` gives the full tool set per profile in-process, including the snapshot and ref engine. The router around it stays thin so a later swap to an own implementation is contained. Dependency versions are pinned exactly, because Playwright MCP releases track pre-release Playwright builds. Two config rules come from the spike below: leave `browser.isolated` unset, since a supplied context cannot create new contexts, and set `sharedBrowserContext: true`.
 
 10. **Concurrency.** Three layers:
     - Daemon spawn: try the socket; on refusal take an `O_EXCL` lock file with pid. The winner spawns the daemon detached and waits for the socket; losers poll the socket up to ~10 s. Stale sockets and dead-pid locks are removed.
     - Profile launch: a per-profile "launching" promise map inside the single-threaded daemon serialises concurrent launches.
-    - Tabs: one persistent context per profile, one embedded Playwright MCP connection per (session, profile) over that shared context. Sessions see each other's tabs but keep their own current tab. Two sessions acting on the same tab is not prevented; the skill tells the agent to open its own tab.
+    - Tabs: one persistent context per profile, one embedded Playwright MCP connection per (session, profile) over that shared context. Current-tab state is per connection, but every new connection starts on the context's first page, so without intervention two sessions share a tab and overwrite each other's navigation. The daemon therefore opens a fresh tab for each (session, profile) connection before forwarding that session's first tool call. After that, sessions see each other's tabs in the tab list but each keeps its own current tab. A session deliberately selecting another session's tab is not prevented.
 
 11. **Node/TypeScript.** Forced by decision 9. Go would add a hop, not remove one, since playwright-go spawns the Node driver anyway. Time goes to page loads and model turns, not to the orchestration layer.
 
@@ -46,7 +46,7 @@ The starting point was a small single-site fetch script: it existed because plai
 
 13. **Every tool takes a required `profile` argument.** Stateless and explicit, like `tabId` in Claude in Chrome. About 8 tokens per call.
 
-14. **Tool surface.** Playwright MCP's core tools plus `vision`, passed through under their upstream names with `profile` added. Removed: `browser_close` (would kill a shared profile) and `browser_install` (the launcher handles downloads). Added: `profile_list`, `profile_create(name, browser, headless?)`, `profile_delete`, `profile_login(profile, url)`, `profile_status`, `daemon_status`.
+14. **Tool surface.** Playwright MCP's core tools plus `vision`, passed through under their upstream names with `profile` added. Removed: `browser_close` (the daemon owns browser lifetime; upstream it also reports closing a page it does not close when the context is supplied, and `sharedBrowserContext: true` makes it refuse instead) and `browser_install` (the launcher handles downloads). Upstream schemas set `additionalProperties: false`, so the router adds `profile` to each schema and strips it before forwarding. Added: `profile_list`, `profile_create(name, browser, headless?)`, `profile_delete`, `profile_login(profile, url)`, `profile_status`, `daemon_status`.
 
 15. **Safety, three layers.** Profile isolation; optional `allowedOrigins` per profile (Playwright MCP implements it, off by default); a skill rule to confirm before irreversible actions (post, send, buy, delete, change settings).
 
@@ -108,6 +108,17 @@ Agent session A                Agent session B
 2. Profiles: `profile.json`, browser detection, `profile_*` tools and CLI, headed login flow, Firefox and WebKit engines.
 3. Hardening: spawn race, idle shutdown, version handshake, `allowedOrigins`, the integration tests.
 4. Ship: skill, `anyb install` with host adapters, Claude Code plugin manifest, README, npm publish.
+
+## Spike: shared context across sessions
+
+Run on 2026-09-18 against `@playwright/mcp` 0.0.81 before any daemon code was written, because decisions 9 and 10 depend on it. Two embedded connections were given the same persistent context and driven from two MCP clients against locally served pages.
+
+- Sharing one persistent context between connections works.
+- Per-session current tab does not work by default: the second session's navigation replaced the first session's page. It works once each session opens its own tab first, and stays isolated through later navigations.
+- Both sessions list all tabs; each marks a different one as current.
+- Closing one session's client leaves the context and the other session working.
+- `browser_close` from one session did not close the page or the context, despite reporting that it had.
+- Tool input schemas are plain JSON Schema and can take an extra required property.
 
 ## Lessons from the prototype
 
