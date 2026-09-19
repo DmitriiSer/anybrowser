@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,13 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 export const cliPath = fileURLToPath(
   new URL("../dist/cli.js", import.meta.url),
 );
+
+/** The package version, read straight from package.json (not from any built artifact). */
+export const packageVersion: string = (
+  JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  ) as { version: string }
+).version;
 
 /** The socket path length limit asserted by src/paths.ts (see that module for the rationale). */
 const SOCKET_PATH_LIMIT = 104;
@@ -71,10 +78,15 @@ export interface CliResult {
   stderr: string;
 }
 
-export function runCli(args: string[], home: string): CliResult {
+export function runCli(
+  args: string[],
+  home: string,
+  options: { timeout?: number } = {},
+): CliResult {
   const result = spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf8",
     env: envFor(home),
+    timeout: options.timeout,
   });
   return {
     status: result.status,
@@ -89,6 +101,10 @@ export function socketPathFor(home: string): string {
 
 export function lockPathFor(home: string): string {
   return join(home, "daemon.lock");
+}
+
+export function logPathFor(home: string): string {
+  return join(home, "daemon.log");
 }
 
 /** Best-effort cleanup: stop the daemon for `home` (if any) and remove the directory. */

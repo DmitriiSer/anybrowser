@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -18,8 +19,10 @@ import {
   envFor,
   isPidAlive,
   lockPathFor,
+  logPathFor,
   makeHome,
   makeMissingHome,
+  packageVersion,
   runCli,
   socketExists,
   socketPathFor,
@@ -165,6 +168,30 @@ describe("anyb mcp", () => {
   );
 
   it(
+    "spawns exactly one daemon process under a 20-client connection race (one 'start pid=' line in daemon.log)",
+    async () => {
+      const clients: ConnectedClient[] = await Promise.all(
+        Array.from({ length: 20 }, () => connectClient(home)),
+      );
+      try {
+        const statuses = await Promise.all(
+          clients.map((c) => daemonStatusFrom(c.client)),
+        );
+        expect(new Set(statuses.map((s) => s.pid)).size).toBe(1);
+
+        const logContent = readFileSync(logPathFor(home), "utf8");
+        const startLines = logContent
+          .split("\n")
+          .filter((line) => line.includes("start pid="));
+        expect(startLines.length).toBe(1);
+      } finally {
+        await Promise.allSettled(clients.map((c) => c.close()));
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
     "connects successfully despite a leftover dead-pid lock and a leftover non-listening socket",
     async () => {
       const { mkdirSync, writeFileSync } = await import("node:fs");
@@ -247,6 +274,110 @@ describe("bad hello line", () => {
       } finally {
         await close();
       }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "an unknown role gets one error line mentioning the role, the connection is closed, and the daemon stays healthy",
+    async () => {
+      // Get a daemon running first.
+      const warm = await connectClient(home);
+      await warm.close();
+      expect(socketExists(home)).toBe(true);
+
+      const helloLine = `{"anybrowser":{"version":"0.0.0-test","role":"bogus"}}\n`;
+
+      const { reply, closed } = await new Promise<{
+        reply: string;
+        closed: boolean;
+      }>((resolve, reject) => {
+        const socket = createConnection(socketPathFor(home));
+        let buffered = "";
+        let sawClose = false;
+        socket.on("connect", () => {
+          socket.write(helloLine);
+        });
+        socket.on("data", (chunk) => {
+          buffered += chunk.toString("utf8");
+        });
+        socket.on("error", reject);
+        socket.on("close", () => {
+          sawClose = true;
+          resolve({ reply: buffered, closed: sawClose });
+        });
+      });
+
+      expect(closed).toBe(true);
+      const lines = reply.split("\n").filter((line) => line.trim().length > 0);
+      expect(lines.length).toBe(1);
+      const parsed = JSON.parse(lines[0]!) as { error?: string };
+      expect(typeof parsed.error).toBe("string");
+      expect(parsed.error).toContain("bogus");
+
+      // The daemon must still work normally afterwards.
+      const { client, close } = await connectClient(home);
+      try {
+        const tools = await client.listTools();
+        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("one-line daemon replies end with exactly one newline", () => {
+  async function rawReply(helloLine: string): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const socket = createConnection(socketPathFor(home));
+      const chunks: Buffer[] = [];
+      socket.on("connect", () => socket.write(helloLine));
+      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      socket.on("error", reject);
+      socket.on("close", () => resolve(Buffer.concat(chunks)));
+    });
+  }
+
+  function expectExactlyOneLine(raw: Buffer): void {
+    expect(raw.length).toBeGreaterThan(0);
+    const newlineCount = Array.from(raw).filter((byte) => byte === 0x0a).length;
+    expect(newlineCount).toBe(1);
+    expect(raw[raw.length - 1]).toBe(0x0a);
+  }
+
+  it(
+    "invalid hello reply is exactly one line ending in a single newline",
+    async () => {
+      const warm = await connectClient(home);
+      await warm.close();
+      const raw = await rawReply("this is not json\n");
+      expectExactlyOneLine(raw);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "status hello reply is exactly one line ending in a single newline",
+    async () => {
+      const warm = await connectClient(home);
+      await warm.close();
+      const helloLine = `{"anybrowser":{"version":"0.0.0-test","role":"status"}}\n`;
+      const raw = await rawReply(helloLine);
+      expectExactlyOneLine(raw);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "stop hello reply is exactly one line ending in a single newline",
+    async () => {
+      const warm = await connectClient(home);
+      await warm.close();
+      const helloLine = `{"anybrowser":{"version":"0.0.0-test","role":"stop"}}\n`;
+      const raw = await rawReply(helloLine);
+      expectExactlyOneLine(raw);
     },
     SPAWN_TIMEOUT,
   );
@@ -550,6 +681,82 @@ describe("anyb stop", () => {
       } finally {
         fakeDaemon.close();
       }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("daemon_status.version", () => {
+  it(
+    "equals the package version through the MCP tool and through 'anyb status'",
+    async () => {
+      const { client, close } = await connectClient(home);
+      try {
+        const status = await daemonStatusFrom(client);
+        expect(status.version).toBe(packageVersion);
+
+        const cliResult = runCli(["status"], home);
+        expect(cliResult.status).toBe(0);
+        const parsed = JSON.parse(cliResult.stdout.trim()) as {
+          version: string;
+        };
+        expect(parsed.version).toBe(packageVersion);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("ANYBROWSER_SPAWN_WAIT_MS", () => {
+  it("anyb mcp times out cleanly when the spawn lock is held throughout, without spawning a daemon or touching the pre-existing lock", () => {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    // A lock file naming THIS test process's own (definitely live) pid,
+    // with a fresh mtime, so every waiter treats it as held (not stale)
+    // for the whole run and nobody spawns a daemon.
+    writeFileSync(lockPathFor(home), String(process.pid));
+
+    const result = spawnSync(process.execPath, [cliPath, "mcp"], {
+      encoding: "utf8",
+      env: { ...envFor(home), ANYBROWSER_SPAWN_WAIT_MS: "600" },
+      timeout: 5000,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    const stderrLines = result.stderr
+      .split("\n")
+      .filter((line) => line.trim().length > 0);
+    expect(stderrLines.length).toBe(1);
+    expect(stderrLines[0]).toMatch(/daemon\.log/);
+    expect(socketExists(home)).toBe(false);
+    expect(existsSync(lockPathFor(home))).toBe(true);
+  }, 10000);
+});
+
+describe("second daemon started while one is already alive", () => {
+  it(
+    "exits 0 quietly-but-logged, leaving the first daemon serving",
+    async () => {
+      const warm = await connectClient(home);
+      const firstStatus = await daemonStatusFrom(warm.client);
+
+      const second = spawnSync(process.execPath, [cliPath, "daemon"], {
+        encoding: "utf8",
+        env: envFor(home),
+        timeout: 10000,
+      });
+
+      expect(second.status).toBe(0);
+      expect(second.stderr).toMatch(/already.*(live|running|alive)/i);
+
+      // The first daemon's pid is unchanged and still serves a client.
+      const stillStatus = await daemonStatusFrom(warm.client);
+      expect(stillStatus.pid).toBe(firstStatus.pid);
+      expect(isPidAlive(firstStatus.pid)).toBe(true);
+
+      await warm.close();
     },
     SPAWN_TIMEOUT,
   );

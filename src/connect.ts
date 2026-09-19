@@ -13,7 +13,22 @@ import { createConnection, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { assertSocketPathFits, type AnybrowserPaths } from "./paths.js";
 
-const SPAWN_DEADLINE_MS = 10000;
+const DEFAULT_SPAWN_WAIT_MS = 10000;
+
+/**
+ * How long `ensureDaemon` waits to connect to (or spawn and connect to) the
+ * daemon before giving up, configurable for tests. Mirrors
+ * `ANYBROWSER_STOP_WAIT_MS` in cli.ts. Invalid values (non-numeric, zero,
+ * negative) fall back to the default.
+ */
+function spawnWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env["ANYBROWSER_SPAWN_WAIT_MS"];
+  if (raw === undefined || raw.trim() === "") {
+    return DEFAULT_SPAWN_WAIT_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SPAWN_WAIT_MS;
+}
 /** Lock is considered stale once it is this old, regardless of its contents. */
 const LOCK_MAX_AGE_MS = 15000;
 /** Lock is considered stale if it's empty/unreadable and at least this old. */
@@ -147,7 +162,7 @@ function displayLogPath(
  */
 export async function ensureDaemon(
   paths: AnybrowserPaths,
-  deadlineMs: number = SPAWN_DEADLINE_MS,
+  deadlineMs: number = spawnWaitMs(),
 ): Promise<Socket> {
   assertSocketPathFits(paths.socket);
 

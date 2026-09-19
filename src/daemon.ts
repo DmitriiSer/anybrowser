@@ -82,6 +82,7 @@ async function claimSocketOrExit(paths: AnybrowserPaths): Promise<void> {
   }
   const alive = await probeSocket(paths.socket);
   if (alive) {
+    log("another daemon is already live on this socket; exiting");
     process.exit(0);
   }
   try {
@@ -108,9 +109,9 @@ function startMcpSession(
     state.sessions.delete(socket);
     log(`session close (sessions=${state.sessions.size})`);
   });
-  socket.on("error", (error) => {
-    log(`session error: ${error.message}`);
-  });
+  // No 'error' listener here: attachHelloHandler already installed the one
+  // permanent listener for this socket's whole life (see its comment), so
+  // adding a second one here would log every socket error twice.
 
   try {
     const transport = new SocketTransport(socket, initialData);
