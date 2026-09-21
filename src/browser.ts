@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { createConnection } from "@playwright/mcp";
 import { chromium, type BrowserContext } from "playwright";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -58,6 +58,49 @@ function addProfileProperty(tool: Tool): Tool {
   };
 }
 
+/** Matches a "[Snapshot](path)" markdown link, as written by upstream's Response.serialize(). */
+const SNAPSHOT_LINK_PATTERN = /\[Snapshot\]\(([^)]+)\)/g;
+
+/**
+ * Upstream (`@playwright/mcp` 0.0.81) always writes a snapshot produced by
+ * `browser_navigate` and friends (any tool using `response.setIncludeSnapshot()`,
+ * as opposed to the dedicated `browser_snapshot` tool) to a FILE and returns
+ * a markdown link, never inline: `Response._includeSnapshot` is `"full"`
+ * there (never `"explicit"`), so `Response._build()`'s `snapshotToFile` is
+ * always true and there is no config knob (`snapshot.mode` is only
+ * `"full" | "none"`) that keeps it inline. That link is written relative to
+ * `Response._clientWorkspace`, which defaults to `context.options.cwd` -
+ * `firstRootPath(clientRoots)` in upstream's `initializeServer`, i.e.
+ * `process.cwd()` when the MCP client declares no `roots` capability, which
+ * our embedded client (below) does not. So the link is always relative to
+ * the DAEMON's cwd, not the outputDir the file actually lives in, and
+ * `path.relative` never produces an absolute result on POSIX - there is no
+ * config that fixes this for the general (non-`browser_snapshot`) tool path.
+ * Cheapest correct fix: resolve the relative link (same `process.cwd()` base
+ * upstream used) to an absolute path before it reaches the agent host.
+ */
+function absolutizeSnapshotLinks(content: unknown[]): unknown[] {
+  return content.map((item) => {
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      (item as { type?: unknown }).type !== "text" ||
+      typeof (item as { text?: unknown }).text !== "string"
+    ) {
+      return item;
+    }
+    const text = (item as { text: string }).text;
+    const rewritten = text.replace(
+      SNAPSHOT_LINK_PATTERN,
+      (match, link: string) =>
+        isAbsolute(link)
+          ? match
+          : `[Snapshot](${resolve(process.cwd(), link)})`,
+    );
+    return rewritten === text ? item : { ...item, text: rewritten };
+  });
+}
+
 /**
  * Owns the one persistent Chromium context per profile, launched lazily on
  * the first browser tool CALL (never on daemon start, never on a bare
@@ -72,11 +115,22 @@ export class BrowserContextRouter {
     private readonly log: (event: string) => void,
   ) {}
 
-  /** Returns the shared persistent context for `profile`, launching it on first use. */
+  /**
+   * Returns the shared persistent context for `profile`, launching it on
+   * first use. A launch that fails is logged and evicted from the cache
+   * (instead of being cached forever), so the next call retries rather than
+   * replaying the same error until the daemon restarts.
+   */
   getContext(profile: string): Promise<BrowserContext> {
     let launching = this.contexts.get(profile);
     if (!launching) {
-      launching = this.launch(profile);
+      launching = this.launch(profile).catch((error: unknown) => {
+        this.contexts.delete(profile);
+        this.log(
+          `browser launch failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
+        );
+        throw error;
+      });
       this.contexts.set(profile, launching);
     }
     return launching;
@@ -86,11 +140,24 @@ export class BrowserContextRouter {
     const profileDir = join(this.paths.home, "profiles", profile);
     const userDataDir = join(profileDir, "user-data");
     const downloadsDir = join(profileDir, "downloads");
+
+    // Logged before anything that can fail (directory creation, the launch
+    // itself), so this line always marks one launch ATTEMPT, whether or not
+    // it succeeds (see getContext's failure handling below).
+    const headless = isHeadless();
+    this.log(`browser launch: profile=${profile} headless=${headless}`);
+
     mkdirSync(userDataDir, { recursive: true });
     mkdirSync(downloadsDir, { recursive: true });
 
-    const headless = isHeadless();
-    this.log(`browser launch: profile=${profile} headless=${headless}`);
+    // Test-only seam: lets tests observe the launch decision (this log line)
+    // without ever opening a real browser, headed or headless. Never set
+    // outside tests.
+    if (process.env["ANYBROWSER_TEST_NO_LAUNCH"] === "1") {
+      throw new Error(
+        "ANYBROWSER_TEST_NO_LAUNCH: browser launch skipped for tests",
+      );
+    }
 
     return chromium.launchPersistentContext(userDataDir, { headless });
   }
@@ -164,7 +231,8 @@ export class BrowserSession {
       name,
       arguments: upstreamArgs,
     });
-    return result as { content: unknown[]; isError?: boolean };
+    const typed = result as { content: unknown[]; isError?: boolean };
+    return { ...typed, content: absolutizeSnapshotLinks(typed.content) };
   }
 
   private async fetchUpstreamTools(): Promise<Tool[]> {
@@ -180,7 +248,14 @@ export class BrowserSession {
   private getConnection(profile: string): Promise<UpstreamConnection> {
     let connection = this.connections.get(profile);
     if (!connection) {
-      connection = this.openConnection(profile);
+      // A failed open (e.g. the underlying browser launch failed) must not
+      // be cached forever: evict it so the next call retries (same reasoning
+      // as BrowserContextRouter.getContext; the launch failure itself is
+      // already logged there).
+      connection = this.openConnection(profile).catch((error: unknown) => {
+        this.connections.delete(profile);
+        throw error;
+      });
       this.connections.set(profile, connection);
     }
     return connection;

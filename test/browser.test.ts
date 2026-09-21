@@ -1,14 +1,31 @@
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { isAbsolute, join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { cleanupHome, connectClient, logPathFor, makeHome } from "./support.js";
+import {
+  cleanupHome,
+  connectClient,
+  logPathFor,
+  makeHome,
+  runCli,
+} from "./support.js";
 
 function logContains(home: string, needle: string): boolean {
   try {
     return readFileSync(logPathFor(home), "utf8").includes(needle);
   } catch {
     return false;
+  }
+}
+
+function countLaunchLines(home: string): number {
+  try {
+    return readFileSync(logPathFor(home), "utf8")
+      .split("\n")
+      .filter((line) => line.includes("browser launch:")).length;
+  } catch {
+    return 0;
   }
 }
 
@@ -243,6 +260,263 @@ describe("two sessions do not steal each other's tab", () => {
       } finally {
         await sessionA.close();
         await sessionB.close();
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("sessions share one browser, and both see all tabs", () => {
+  it(
+    "browser_tabs list from one session shows tabs opened by both sessions, and the browser launches exactly once",
+    async () => {
+      const pageServer = await startPageServer();
+      const sessionA = await connectClient(home);
+      const sessionB = await connectClient(home);
+      try {
+        await sessionA.client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        await sessionB.client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/b`,
+          },
+        });
+
+        const tabsResult = await sessionA.client.callTool({
+          name: "browser_tabs",
+          arguments: { profile: "default-in-chromium", action: "list" },
+        });
+        const text = snapshotText(
+          tabsResult as { content: Array<{ type: string; text?: string }> },
+        );
+        expect(text).toContain("[A]");
+        expect(text).toContain("[B]");
+
+        expect(countLaunchLines(home)).toBe(1);
+      } finally {
+        await sessionA.close();
+        await sessionB.close();
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("one session closing does not break the other; the daemon outlives all sessions", () => {
+  it(
+    "A keeps working after B closes, and after A closes too the daemon is alive and a new session reuses the browser without a second launch",
+    async () => {
+      const pageServer = await startPageServer();
+      const sessionA = await connectClient(home);
+      const sessionB = await connectClient(home);
+      try {
+        await sessionA.client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        await sessionB.client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/b`,
+          },
+        });
+
+        await sessionB.close();
+
+        const snapA = await sessionA.client.callTool({
+          name: "browser_snapshot",
+          arguments: { profile: "default-in-chromium" },
+        });
+        expect(snapA.isError).toBeFalsy();
+        expect(
+          snapshotText(
+            snapA as { content: Array<{ type: string; text?: string }> },
+          ),
+        ).toContain("Page A");
+
+        await sessionA.close();
+
+        const status = runCli(["status"], home);
+        expect(status.status).toBe(0);
+
+        const sessionC = await connectClient(home);
+        try {
+          const navC = await sessionC.client.callTool({
+            name: "browser_navigate",
+            arguments: {
+              profile: "default-in-chromium",
+              url: `${pageServer.url}/a`,
+            },
+          });
+          expect(navC.isError).toBeFalsy();
+        } finally {
+          await sessionC.close();
+        }
+
+        expect(countLaunchLines(home)).toBe(1);
+      } finally {
+        await sessionA.close().catch(() => {});
+        await sessionB.close().catch(() => {});
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("ANYBROWSER_TEST_NO_LAUNCH test-only hook", () => {
+  it(
+    "logs the launch line but skips the actual browser launch, so the tool call errors instead of opening a window",
+    async () => {
+      const { client, close } = await connectClient(home, {
+        // headless=1 keeps this safe even before the hook exists: worst case
+        // (hook missing) is a real HEADLESS launch, never a visible window.
+        ANYBROWSER_HEADLESS: "1",
+        ANYBROWSER_TEST_NO_LAUNCH: "1",
+      });
+      try {
+        const result = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "default-in-chromium", url: "about:blank" },
+        });
+        expect(result.isError).toBe(true);
+        expect(logContains(home, "browser launch:")).toBe(true);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("ANYBROWSER_HEADLESS is honoured", () => {
+  const cases: Array<{
+    label: string;
+    value: string | undefined;
+    expected: "true" | "false";
+  }> = [
+    { label: "unset", value: undefined, expected: "false" },
+    { label: "'1'", value: "1", expected: "true" },
+    { label: "'true'", value: "true", expected: "true" },
+    { label: "'0'", value: "0", expected: "false" },
+  ];
+
+  for (const { label, value, expected } of cases) {
+    it(
+      `logs headless=${expected} when ANYBROWSER_HEADLESS is ${label}`,
+      async () => {
+        // The whole-file beforeAll sets ANYBROWSER_HEADLESS=1 for safety;
+        // override or, for the "unset" case, explicitly remove it. Safe to
+        // truly unset here because ANYBROWSER_TEST_NO_LAUNCH=1 guarantees no
+        // real browser (headed or headless) is ever launched.
+        const { client, close } = await connectClient(home, {
+          ANYBROWSER_TEST_NO_LAUNCH: "1",
+          ANYBROWSER_HEADLESS: value,
+        });
+        try {
+          await client.callTool({
+            name: "browser_navigate",
+            arguments: {
+              profile: "default-in-chromium",
+              url: "about:blank",
+            },
+          });
+          expect(logContains(home, `headless=${expected}`)).toBe(true);
+        } finally {
+          await close();
+        }
+      },
+      SPAWN_TIMEOUT,
+    );
+  }
+});
+
+describe("bug A: a failed browser launch does not poison the profile", () => {
+  it(
+    "a browser tool call succeeds once the launch obstruction is removed, and the log shows two launch attempts",
+    async () => {
+      const profileDir = join(home, "profiles", "default-in-chromium");
+      const userDataDir = join(profileDir, "user-data");
+      mkdirSync(profileDir, { recursive: true });
+      // Pre-create a regular FILE where the user-data directory should be,
+      // so mkdirSync(userDataDir, { recursive: true }) inside launch() fails.
+      writeFileSync(userDataDir, "not a directory");
+
+      const { client, close } = await connectClient(home);
+      try {
+        const first = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "default-in-chromium", url: "about:blank" },
+        });
+        expect(first.isError).toBe(true);
+        // Today's bug: the failed launch is cached, so nothing short of a
+        // daemon restart lets a later call succeed.
+        expect(logContains(home, "browser launch failed:")).toBe(true);
+        const attemptsAfterFirstCall = countLaunchLines(home);
+        expect(attemptsAfterFirstCall).toBeGreaterThanOrEqual(1);
+
+        unlinkSync(userDataDir);
+
+        const second = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "default-in-chromium", url: "about:blank" },
+        });
+        expect(second.isError).toBeFalsy();
+
+        // The fix must retry: at least one more launch attempt happens after
+        // the obstruction is removed, and it is the one that succeeds.
+        expect(countLaunchLines(home)).toBeGreaterThan(attemptsAfterFirstCall);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("bug B: browser_navigate's snapshot link is usable outside the daemon's cwd", () => {
+  it(
+    "the navigate result shows the page heading inline, or an absolute snapshot link whose file exists and contains it",
+    async () => {
+      const pageServer = await startPageServer();
+      const { client, close } = await connectClient(home);
+      try {
+        const navResult = await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        expect(navResult.isError).toBeFalsy();
+        const text = snapshotText(
+          navResult as { content: Array<{ type: string; text?: string }> },
+        );
+
+        if (text.includes("Page A")) {
+          return;
+        }
+
+        const match = text.match(/\[Snapshot\]\(([^)]+)\)/);
+        expect(match).not.toBeNull();
+        const link = match![1] as string;
+        expect(isAbsolute(link)).toBe(true);
+        expect(readFileSync(link, "utf8")).toContain("Page A");
+      } finally {
+        await close();
         await pageServer.close();
       }
     },

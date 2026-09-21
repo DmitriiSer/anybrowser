@@ -132,12 +132,27 @@ export interface ConnectedClient {
   proxyPid: number;
 }
 
-/** Connects an MCP client through `anyb mcp` (spawns the daemon if absent). */
-export async function connectClient(home: string): Promise<ConnectedClient> {
+/**
+ * Connects an MCP client through `anyb mcp` (spawns the daemon if absent).
+ * `extraEnv` overrides or, with an explicit `undefined` value, removes a var
+ * that would otherwise be inherited from `envFor(home)`.
+ */
+export async function connectClient(
+  home: string,
+  extraEnv: Record<string, string | undefined> = {},
+): Promise<ConnectedClient> {
+  const env = envFor(home);
+  for (const [key, value] of Object.entries(extraEnv)) {
+    if (value === undefined) {
+      delete env[key];
+    } else {
+      env[key] = value;
+    }
+  }
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [cliPath, "mcp"],
-    env: envFor(home),
+    env,
     stderr: "inherit",
   });
   const client = new Client({

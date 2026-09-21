@@ -29,6 +29,8 @@
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "vitest run",
+    "test:unit": "npm run build && vitest run --config vitest.unit.config.ts",
+    "test:browser": "npm run build && vitest run --config vitest.browser.config.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

@@ -19,5 +19,40 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:unit
       - run: npm run format:check
+
+  browser-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Resolve installed Playwright version
+        id: playwright-version
+        run: echo "version=$(node -p "require('playwright-core/package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/ms-playwright
+            ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
+      - name: Install Playwright Chromium (Linux)
+        if: runner.os == 'Linux' && steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Install Playwright system dependencies (Linux, cache hit)
+        if: runner.os == 'Linux' && steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+      - name: Install Playwright Chromium (macOS)
+        if: runner.os == 'macOS' && steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
+      - run: npm run test:browser
