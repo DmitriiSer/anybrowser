@@ -84,12 +84,12 @@ describe("first run (state directory does not exist yet)", () => {
 
 describe("anyb mcp", () => {
   it(
-    "spawns the daemon on demand, lists exactly daemon_status, and reports its own session",
+    "spawns the daemon on demand, lists daemon_status among its tools, and reports its own session",
     async () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
 
         const status = await daemonStatusFrom(client);
         expect(status.pid).not.toBe(process.pid);
@@ -209,7 +209,7 @@ describe("anyb mcp", () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
       } finally {
         await close();
       }
@@ -270,7 +270,7 @@ describe("bad hello line", () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
       } finally {
         await close();
       }
@@ -319,7 +319,7 @@ describe("bad hello line", () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
       } finally {
         await close();
       }
@@ -459,7 +459,7 @@ describe("stale lock detection", () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
         expect(Date.now() - start).toBeLessThan(8000);
       } finally {
         await close();
@@ -480,7 +480,7 @@ describe("stale lock detection", () => {
       const { client, close } = await connectClient(home);
       try {
         const tools = await client.listTools();
-        expect(tools.tools.map((t) => t.name)).toEqual(["daemon_status"]);
+        expect(tools.tools.map((t) => t.name)).toContain("daemon_status");
         expect(Date.now() - start).toBeLessThan(8000);
       } finally {
         await close();

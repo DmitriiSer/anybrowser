@@ -19,6 +19,7 @@ import {
 } from "./hello.js";
 import { readVersion } from "./version.js";
 import { SocketTransport } from "./transport.js";
+import { BrowserContextRouter, BrowserSession } from "./browser.js";
 
 const DAEMON_STATUS_TOOL: Tool = {
   name: "daemon_status",
@@ -41,6 +42,7 @@ interface DaemonState {
   sessions: Set<Socket>;
   server: NetServer;
   shuttingDown: boolean;
+  browserRouter: BrowserContextRouter;
 }
 
 function log(event: string): void {
@@ -119,21 +121,23 @@ function startMcpSession(
       { name: "anybrowser", version: state.version },
       { capabilities: { tools: {} } },
     );
+    const browserSession = new BrowserSession(state.browserRouter);
 
-    server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: [DAEMON_STATUS_TOOL],
-    }));
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      const browserTools = await browserSession.listTools();
+      return { tools: [DAEMON_STATUS_TOOL, ...browserTools] };
+    });
 
-    server.setRequestHandler(CallToolRequestSchema, (request) => {
-      if (request.params.name !== "daemon_status") {
-        throw new McpError(
-          ErrorCode.MethodNotFound,
-          `unknown tool '${request.params.name}'`,
-        );
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      if (request.params.name === "daemon_status") {
+        return {
+          content: [{ type: "text", text: JSON.stringify(buildStatus(state)) }],
+        };
       }
-      return {
-        content: [{ type: "text", text: JSON.stringify(buildStatus(state)) }],
-      };
+      return browserSession.callTool(
+        request.params.name,
+        (request.params.arguments ?? {}) as Record<string, unknown>,
+      );
     });
 
     server.connect(transport).catch((error: unknown) => {
@@ -265,6 +269,7 @@ export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
     sessions: new Set(),
     server,
     shuttingDown: false,
+    browserRouter: new BrowserContextRouter(paths, log),
   };
 
   server.on("connection", (socket) => {
