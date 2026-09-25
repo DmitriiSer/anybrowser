@@ -1,9 +1,16 @@
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { isAbsolute, join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
+  addProfile,
   cleanupHome,
   connectClient,
   logPathFor,
@@ -82,6 +89,11 @@ beforeAll(() => {
 
 beforeEach(() => {
   home = makeHome();
+  // Most tests below reference the "default-in-chromium" id, created up
+  // front so router changes are driven by real profile.json data rather
+  // than a hard-coded string. Tests exercising unknown/missing profiles
+  // deliberately use a different id and are unaffected by this.
+  addProfile(home, "default", "chromium");
 });
 
 afterEach(() => {
@@ -138,6 +150,33 @@ describe("the browser launches lazily", () => {
         expect(logContains(home, "browser launch")).toBe(true);
       } finally {
         await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("a browser tool call drives a real page for a profile created via 'anyb profile add'", () => {
+  it(
+    "navigates and snapshots a locally served page using a freshly created profile id (not any hard-coded one)",
+    async () => {
+      const id = addProfile(home, "custom", "chromium");
+      expect(id).toBe("custom-in-chromium");
+
+      const pageServer = await startPageServer();
+      const { client, close } = await connectClient(home);
+      try {
+        const navResult = await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: id,
+            url: `${pageServer.url}/a`,
+          },
+        });
+        expect(navResult.isError).toBeFalsy();
+      } finally {
+        await close();
+        await pageServer.close();
       }
     },
     SPAWN_TIMEOUT,
@@ -479,6 +518,63 @@ describe("bug A: a failed browser launch does not poison the profile", () => {
         // The fix must retry: at least one more launch attempt happens after
         // the obstruction is removed, and it is the one that succeeds.
         expect(countLaunchLines(home)).toBeGreaterThan(attemptsAfterFirstCall);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("profile_status reflects a real running browser", () => {
+  it(
+    "reports running=true and a tab count of at least one after a browser tool call",
+    async () => {
+      const { client, close } = await connectClient(home);
+      try {
+        await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "default-in-chromium", url: "about:blank" },
+        });
+
+        const result = await client.callTool({
+          name: "profile_status",
+          arguments: { profile: "default-in-chromium" },
+        });
+        const parsed = JSON.parse(
+          snapshotText(
+            result as { content: Array<{ type: string; text?: string }> },
+          ),
+        ) as { running: boolean; tabCount: number };
+        expect(parsed.running).toBe(true);
+        expect(parsed.tabCount).toBeGreaterThanOrEqual(1);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("anyb profile remove refuses a running profile", () => {
+  it(
+    "exits 1 and does not delete the profile directory while its browser is running",
+    async () => {
+      const { client, close } = await connectClient(home);
+      try {
+        await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "default-in-chromium", url: "about:blank" },
+        });
+
+        const dir = join(home, "profiles", "default-in-chromium");
+        const result = runCli(
+          ["profile", "remove", "default-in-chromium"],
+          home,
+        );
+        expect(result.status).toBe(1);
+        expect(result.stderr).toMatch(/default-in-chromium/);
+        expect(existsSync(dir)).toBe(true);
       } finally {
         await close();
       }

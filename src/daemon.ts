@@ -19,7 +19,17 @@ import {
 } from "./hello.js";
 import { readVersion } from "./version.js";
 import { SocketTransport } from "./transport.js";
-import { BrowserContextRouter, BrowserSession } from "./browser.js";
+import {
+  BrowserContextRouter,
+  BrowserSession,
+  ProfileHeadlessRunningError,
+} from "./browser.js";
+import {
+  addProfileWithDetection,
+  listProfiles,
+  profileExists,
+  readProfile,
+} from "./profile.js";
 
 const DAEMON_STATUS_TOOL: Tool = {
   name: "daemon_status",
@@ -31,6 +41,80 @@ const DAEMON_STATUS_TOOL: Tool = {
     additionalProperties: false,
   },
 };
+
+const PROFILE_LIST_TOOL: Tool = {
+  name: "profile_list",
+  description:
+    "List every anybrowser profile: id, browser, headless, and whether it is currently running.",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
+};
+
+const PROFILE_CREATE_TOOL: Tool = {
+  name: "profile_create",
+  description:
+    "Create a new anybrowser profile. `browser` is one of chrome, chromium, brave, edge, arc, vivaldi, opera. Returns the new profile's id.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      name: {
+        type: "string",
+        description:
+          "A lowercase slug, e.g. 'work'. Composed into the id as '<name>-in-<browser>'.",
+      },
+      browser: {
+        type: "string",
+        description: "chrome | chromium | brave | edge | arc | vivaldi | opera",
+      },
+      headless: {
+        type: "boolean",
+        description: "Defaults to false.",
+      },
+    },
+    required: ["name", "browser"],
+    additionalProperties: false,
+  },
+};
+
+const PROFILE_STATUS_TOOL: Tool = {
+  name: "profile_status",
+  description:
+    "Report a profile's running state, tab count (when running), headless flag, and browser.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      profile: { type: "string", description: "The profile id." },
+    },
+    required: ["profile"],
+    additionalProperties: false,
+  },
+};
+
+const PROFILE_LOGIN_TOOL: Tool = {
+  name: "profile_login",
+  description:
+    "Open `url` in a new, foregrounded tab of `profile`'s browser (launching it headed if not already running), so a human can log in. Returns immediately; ask the user to log in, then verify with a snapshot.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      profile: { type: "string", description: "The profile id." },
+      url: { type: "string", description: "The URL to open for login." },
+    },
+    required: ["profile", "url"],
+    additionalProperties: false,
+  },
+};
+
+const DAEMON_TOOLS: Tool[] = [
+  DAEMON_STATUS_TOOL,
+  PROFILE_LIST_TOOL,
+  PROFILE_CREATE_TOOL,
+  PROFILE_STATUS_TOOL,
+  PROFILE_LOGIN_TOOL,
+];
 
 /** Bytes we'll buffer looking for the hello line's newline before giving up on a connection. */
 const MAX_HELLO_LINE_BYTES = 4096;
@@ -55,7 +139,7 @@ function buildStatus(state: DaemonState): DaemonStatus {
     pid: process.pid,
     uptimeSeconds: (Date.now() - state.startedAt) / 1000,
     sessions: state.sessions.size,
-    profiles: [],
+    profiles: state.browserRouter.runningProfileIds(),
   };
 }
 
@@ -125,13 +209,122 @@ function startMcpSession(
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const browserTools = await browserSession.listTools();
-      return { tools: [DAEMON_STATUS_TOOL, ...browserTools] };
+      return { tools: [...DAEMON_TOOLS, ...browserTools] };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (request.params.name === "daemon_status") {
         return {
           content: [{ type: "text", text: JSON.stringify(buildStatus(state)) }],
+        };
+      }
+      if (request.params.name === "profile_list") {
+        const profiles = listProfiles(state.paths).map((profile) => ({
+          id: profile.id,
+          browser: profile.browser,
+          headless: profile.headless,
+          running: state.browserRouter.runningProfileIds().includes(profile.id),
+        }));
+        return {
+          content: [{ type: "text", text: JSON.stringify(profiles) }],
+        };
+      }
+      if (request.params.name === "profile_create") {
+        const args = (request.params.arguments ?? {}) as {
+          name?: unknown;
+          browser?: unknown;
+          headless?: unknown;
+        };
+        if (typeof args.name !== "string" || typeof args.browser !== "string") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "profile_create requires string 'name' and 'browser'",
+              },
+            ],
+          };
+        }
+        const outcome = addProfileWithDetection(state.paths, {
+          name: args.name,
+          browser: args.browser,
+          headless: args.headless === true,
+        });
+        if (!outcome.ok) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: outcome.message }],
+          };
+        }
+        return { content: [{ type: "text", text: outcome.id }] };
+      }
+      if (request.params.name === "profile_status") {
+        const args = (request.params.arguments ?? {}) as { profile?: unknown };
+        if (typeof args.profile !== "string" || args.profile.length === 0) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "profile_status requires a string 'profile' argument",
+          );
+        }
+        if (!profileExists(state.paths, args.profile)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `unknown profile '${args.profile}'`,
+          );
+        }
+        const stored = readProfile(state.paths, args.profile)!;
+        const runningContext = state.browserRouter.runningContext(args.profile);
+        const status = {
+          running: runningContext !== undefined,
+          headless: stored.headless,
+          browser: stored.browser,
+          ...(runningContext
+            ? { tabCount: runningContext.pages().length }
+            : {}),
+        };
+        return { content: [{ type: "text", text: JSON.stringify(status) }] };
+      }
+      if (request.params.name === "profile_login") {
+        const args = (request.params.arguments ?? {}) as {
+          profile?: unknown;
+          url?: unknown;
+        };
+        if (
+          typeof args.profile !== "string" ||
+          args.profile.length === 0 ||
+          typeof args.url !== "string" ||
+          args.url.length === 0
+        ) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            "profile_login requires string 'profile' and 'url' arguments",
+          );
+        }
+        if (!profileExists(state.paths, args.profile)) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `unknown profile '${args.profile}'`,
+          );
+        }
+        try {
+          await state.browserRouter.loginLaunch(args.profile, args.url);
+        } catch (error) {
+          if (error instanceof ProfileHeadlessRunningError) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: error.message }],
+            };
+          }
+          throw error;
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Opened ${args.url} in a new tab for profile '${args.profile}'. Ask the user to log in, then verify with a snapshot.`,
+            },
+          ],
         };
       }
       return browserSession.callTool(

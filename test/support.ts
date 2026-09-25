@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -81,11 +81,22 @@ export interface CliResult {
 export function runCli(
   args: string[],
   home: string,
-  options: { timeout?: number } = {},
+  options: {
+    timeout?: number;
+    env?: Record<string, string | undefined>;
+  } = {},
 ): CliResult {
+  const env = envFor(home);
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    if (value === undefined) {
+      delete env[key];
+    } else {
+      env[key] = value;
+    }
+  }
   const result = spawnSync(process.execPath, [cliPath, ...args], {
     encoding: "utf8",
-    env: envFor(home),
+    env,
     timeout: options.timeout,
   });
   return {
@@ -93,6 +104,42 @@ export function runCli(
     stdout: result.stdout,
     stderr: result.stderr,
   };
+}
+
+/**
+ * Like `runCli`, but spawns asynchronously (never blocks the event loop).
+ * REQUIRED instead of `runCli` in any test that also hosts an in-process
+ * server (e.g. a local HTTP page server): `spawnSync` freezes this process's
+ * event loop for the whole child lifetime, so that in-process server could
+ * never accept a connection from a browser the child launches.
+ */
+export function runCliAsync(
+  args: string[],
+  home: string,
+  options: { env?: Record<string, string | undefined> } = {},
+): Promise<CliResult> {
+  const env = envFor(home);
+  for (const [key, value] of Object.entries(options.env ?? {})) {
+    if (value === undefined) {
+      delete env[key];
+    } else {
+      env[key] = value;
+    }
+  }
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cliPath, ...args], { env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("close", (code) => {
+      resolve({ status: code, stdout, stderr });
+    });
+  });
 }
 
 export function socketPathFor(home: string): string {
@@ -224,4 +271,31 @@ export async function waitFor(
 
 export function socketExists(home: string): boolean {
   return existsSync(socketPathFor(home));
+}
+
+/**
+ * Creates a profile via `anyb profile add` (filesystem only, no daemon) and
+ * returns its id. Throws if the CLI call fails, so callers see a clear error
+ * instead of a mysterious later failure.
+ */
+export function addProfile(
+  home: string,
+  name: string,
+  browser: string,
+  options: {
+    headless?: boolean;
+    env?: Record<string, string | undefined>;
+  } = {},
+): string {
+  const args = ["profile", "add", name, browser];
+  if (options.headless) {
+    args.push("--headless");
+  }
+  const result = runCli(args, home, options.env ? { env: options.env } : {});
+  if (result.status !== 0) {
+    throw new Error(
+      `addProfile(${name}, ${browser}) failed: status=${result.status} stderr=${result.stderr}`,
+    );
+  }
+  return result.stdout.trim();
 }

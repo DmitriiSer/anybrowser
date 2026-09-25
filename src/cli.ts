@@ -1,11 +1,20 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 import type { Socket } from "node:net";
-import { connectOnce } from "./connect.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { connectOnce, ensureDaemon } from "./connect.js";
 import { runDaemon } from "./daemon.js";
-import { formatHelloLine } from "./hello.js";
+import { formatHelloLine, type DaemonStatus } from "./hello.js";
 import { resolvePaths } from "./paths.js";
+import {
+  addProfileWithDetection,
+  listProfiles,
+  profileExists,
+  removeProfile,
+  setProfileSetting,
+} from "./profile.js";
 import { runProxy } from "./proxy.js";
+import { SocketTransport } from "./transport.js";
 import { readVersion } from "./version.js";
 
 const USAGE = `usage: anyb <command>
@@ -72,6 +81,27 @@ async function runStatusCommand(): Promise<number> {
   return 0;
 }
 
+/** Fetches daemon status over the socket if a daemon is running; null if not (never starts one). */
+async function fetchDaemonStatus(
+  paths: ReturnType<typeof resolvePaths>,
+): Promise<DaemonStatus | null> {
+  const socket = await connectOnce(paths.socket);
+  if (!socket) {
+    return null;
+  }
+  socket.write(formatHelloLine("status", readVersion()));
+  const line = await readLine(socket);
+  socket.destroy();
+  if (line === null) {
+    return null;
+  }
+  try {
+    return JSON.parse(line) as DaemonStatus;
+  } catch {
+    return null;
+  }
+}
+
 const DEFAULT_STOP_WAIT_MS = 5000;
 
 /** How long `anyb stop` waits for the socket file to disappear, configurable for tests. */
@@ -113,6 +143,162 @@ async function runStopCommand(): Promise<number> {
   return 0;
 }
 
+function runProfileAddCommand(args: string[]): number {
+  const [name, browser, ...rest] = args;
+  if (name === undefined || browser === undefined) {
+    console.error(
+      "anyb: usage: anyb profile add <name> <browser> [--headless]",
+    );
+    return 2;
+  }
+  const headless = rest.includes("--headless");
+
+  const paths = resolvePaths();
+  const outcome = addProfileWithDetection(paths, { name, browser, headless });
+  if (!outcome.ok) {
+    console.error(`anyb: ${outcome.message}`);
+    return outcome.kind === "invalid-name" || outcome.kind === "invalid-browser"
+      ? 2
+      : 1;
+  }
+  console.log(outcome.id);
+  return 0;
+}
+
+function runProfileListCommand(): number {
+  const paths = resolvePaths();
+  const profiles = listProfiles(paths);
+  if (profiles.length === 0) {
+    console.log("no profiles");
+    return 0;
+  }
+  for (const profile of profiles) {
+    console.log(
+      `${profile.id}  ${profile.browser}  headless=${profile.headless}`,
+    );
+  }
+  return 0;
+}
+
+async function runProfileRemoveCommand(args: string[]): Promise<number> {
+  const [id] = args;
+  if (id === undefined) {
+    console.error("anyb: usage: anyb profile remove <id>");
+    return 2;
+  }
+  const paths = resolvePaths();
+  if (!profileExists(paths, id)) {
+    console.error(`anyb: profile '${id}' does not exist`);
+    return 1;
+  }
+  const status = await fetchDaemonStatus(paths);
+  if (status && status.profiles.includes(id)) {
+    console.error(
+      `anyb: profile '${id}' is running; stop the daemon first ('anyb stop')`,
+    );
+    return 1;
+  }
+  removeProfile(paths, id);
+  return 0;
+}
+
+function runProfileSetCommand(args: string[]): number {
+  const [id, assignment] = args;
+  if (
+    id === undefined ||
+    assignment === undefined ||
+    !assignment.includes("=")
+  ) {
+    console.error("anyb: usage: anyb profile set <id> <key>=<value>");
+    return 2;
+  }
+  const [key, value] = assignment.split("=", 2) as [string, string];
+  const paths = resolvePaths();
+  if (!profileExists(paths, id)) {
+    console.error(`anyb: profile '${id}' does not exist`);
+    return 1;
+  }
+  try {
+    setProfileSetting(paths, id, key, value);
+    return 0;
+  } catch (error) {
+    console.error(
+      `anyb: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 2;
+  }
+}
+
+/**
+ * `anyb profile login <id> <url>`: an MCP client over the daemon socket
+ * calling `profile_login`, because only the daemon may own a profile's
+ * browser. Spawns the daemon if needed, the same way `anyb mcp` does.
+ */
+async function runProfileLoginCommand(args: string[]): Promise<number> {
+  const [id, url] = args;
+  if (id === undefined || url === undefined) {
+    console.error("anyb: usage: anyb profile login <id> <url>");
+    return 2;
+  }
+
+  const paths = resolvePaths();
+  let socket: Socket;
+  try {
+    socket = await ensureDaemon(paths);
+  } catch (error) {
+    console.error(
+      `anyb: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  }
+  socket.write(formatHelloLine("mcp", readVersion()));
+
+  const client = new Client({ name: "anybrowser-cli", version: readVersion() });
+  try {
+    await client.connect(new SocketTransport(socket));
+    const result = await client.callTool({
+      name: "profile_login",
+      arguments: { profile: id, url },
+    });
+    const content = result.content as Array<{ type: string; text?: string }>;
+    const text = content.find((item) => item.type === "text")?.text ?? "";
+    if (result.isError) {
+      console.error(`anyb: ${text}`);
+      return 1;
+    }
+    console.log(text);
+    return 0;
+  } catch (error) {
+    console.error(
+      `anyb: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return 1;
+  } finally {
+    await client.close();
+  }
+}
+
+async function runProfileCommand(args: string[]): Promise<number> {
+  const [subcommand, ...rest] = args;
+  if (subcommand === "add") {
+    return runProfileAddCommand(rest);
+  }
+  if (subcommand === "list") {
+    return runProfileListCommand();
+  }
+  if (subcommand === "remove") {
+    return runProfileRemoveCommand(rest);
+  }
+  if (subcommand === "set") {
+    return runProfileSetCommand(rest);
+  }
+  if (subcommand === "login") {
+    return runProfileLoginCommand(rest);
+  }
+  console.error(`anyb: unknown 'profile' subcommand '${String(subcommand)}'`);
+  return 2;
+}
+
 async function main(argv: string[]): Promise<number> {
   const [command] = argv;
 
@@ -136,6 +322,9 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === "stop") {
     return runStopCommand();
+  }
+  if (command === "profile") {
+    return await runProfileCommand(argv.slice(1));
   }
 
   console.error(`anyb: unknown command '${command}'\n\n${USAGE}`);

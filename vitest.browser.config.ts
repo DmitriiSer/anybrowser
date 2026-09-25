@@ -5,6 +5,6 @@ import { defineConfig } from "vitest/config";
 // complementary half and vitest.config.ts for the full local suite.
 export default defineConfig({
   test: {
-    include: ["test/browser.test.ts"],
+    include: ["test/**/*.browser.test.ts"],
   },
 });

@@ -1,5 +1,5 @@
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
 import { createConnection } from "@playwright/mcp";
 import { chromium, type BrowserContext } from "playwright";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -7,12 +7,16 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { AnybrowserPaths } from "./paths.js";
+import { profileExists, readProfile } from "./profile.js";
 
 /**
- * The one hard-coded profile this slice supports. Profile management
- * (multiple profiles, browser choice, creation) is a later slice.
+ * A reserved key used only to fetch the upstream tool schema (never a real
+ * profile id: real ids always contain "-in-", which this key does not, so it
+ * can never collide with one). Listing tools never touches the router's
+ * `contextGetter`, so this never launches a browser or requires any profile
+ * to exist.
  */
-export const HARD_CODED_PROFILE = "default-in-chromium";
+const TOOLS_SCHEMA_KEY = "__anybrowser_tools_schema__";
 
 /**
  * Tools the daemon removes from upstream's list: the daemon owns browser
@@ -107,8 +111,15 @@ function absolutizeSnapshotLinks(content: unknown[]): unknown[] {
  * `tools/list`). A per-profile "launching" promise makes concurrent first
  * calls share one launch instead of racing (decision 10).
  */
+/** Thrown by `BrowserContextRouter.loginLaunch` when a profile is already running headless without the global override. */
+export class ProfileHeadlessRunningError extends Error {}
+
 export class BrowserContextRouter {
   private readonly contexts = new Map<string, Promise<BrowserContext>>();
+  /** Profiles whose launch has SUCCEEDED (a resolved context), for profile_status/profile_list/daemon_status. */
+  private readonly runningContexts = new Map<string, BrowserContext>();
+  /** Whether each running profile's browser is headless, for profile_login's headless-relaunch guard. */
+  private readonly runningHeadless = new Map<string, boolean>();
 
   constructor(
     readonly paths: AnybrowserPaths,
@@ -120,32 +131,106 @@ export class BrowserContextRouter {
    * first use. A launch that fails is logged and evicted from the cache
    * (instead of being cached forever), so the next call retries rather than
    * replaying the same error until the daemon restarts.
+   *
+   * `headlessOverride`, when given, is used INSTEAD of the profile's own
+   * `headless` flag for a first launch (used by `loginLaunch`, decision 12:
+   * a human must see the login window). Ignored once the profile is already
+   * running.
    */
-  getContext(profile: string): Promise<BrowserContext> {
+  getContext(
+    profile: string,
+    headlessOverride?: boolean,
+  ): Promise<BrowserContext> {
     let launching = this.contexts.get(profile);
     if (!launching) {
-      launching = this.launch(profile).catch((error: unknown) => {
-        this.contexts.delete(profile);
-        this.log(
-          `browser launch failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
-        );
-        throw error;
-      });
+      launching = this.launch(profile, headlessOverride)
+        .then((context) => {
+          this.runningContexts.set(profile, context);
+          return context;
+        })
+        .catch((error: unknown) => {
+          this.contexts.delete(profile);
+          this.log(
+            `browser launch failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
+          );
+          throw error;
+        });
       this.contexts.set(profile, launching);
     }
     return launching;
   }
 
-  private async launch(profile: string): Promise<BrowserContext> {
+  /** Ids of profiles with a currently running (successfully launched) browser, sorted. */
+  runningProfileIds(): string[] {
+    return [...this.runningContexts.keys()].sort();
+  }
+
+  /** The running context for `profile`, or undefined if it isn't currently running. */
+  runningContext(profile: string): BrowserContext | undefined {
+    return this.runningContexts.get(profile);
+  }
+
+  /**
+   * Launches `profile` HEADED (unless the global ANYBROWSER_HEADLESS
+   * override is set) if it isn't already running, opens `url` in a new tab
+   * and brings it to front (decision 12). If the profile is already running
+   * headless without the global override, throws
+   * `ProfileHeadlessRunningError` rather than silently relaunching under a
+   * live session (out of scope for this slice).
+   */
+  async loginLaunch(profile: string, url: string): Promise<void> {
+    const alreadyRunning = this.runningContexts.get(profile);
+    let context: BrowserContext;
+    if (alreadyRunning) {
+      const headless = this.runningHeadless.get(profile) ?? false;
+      if (headless && !isHeadless()) {
+        throw new ProfileHeadlessRunningError(
+          `profile '${profile}' is already running headless; restart it headed first (e.g. 'anyb stop') before logging in`,
+        );
+      }
+      context = alreadyRunning;
+    } else {
+      context = await this.getContext(profile, isHeadless());
+    }
+    const page = await context.newPage();
+    await page.goto(url);
+    await page.bringToFront();
+  }
+
+  private async launch(
+    profile: string,
+    headlessOverride?: boolean,
+  ): Promise<BrowserContext> {
+    const stored = readProfile(this.paths, profile);
+    if (!stored) {
+      // Should not normally happen: BrowserSession checks existence before
+      // calling getContext. Guards against a profile removed mid-flight.
+      throw new Error(`unknown profile '${profile}'`);
+    }
+
     const profileDir = join(this.paths.home, "profiles", profile);
     const userDataDir = join(profileDir, "user-data");
     const downloadsDir = join(profileDir, "downloads");
 
+    // Headless if the profile says so OR the global override is set; the
+    // global override remains available for tests and CI regardless of what
+    // any individual profile stores. A caller-supplied override (login)
+    // replaces the profile's own flag entirely instead of OR-ing with it.
+    const headless =
+      headlessOverride !== undefined
+        ? headlessOverride
+        : stored.headless || isHeadless();
+    this.runningHeadless.set(profile, headless);
+    const executableLabel = stored.executablePath
+      ? basename(stored.executablePath)
+      : "playwright-chromium";
+
     // Logged before anything that can fail (directory creation, the launch
     // itself), so this line always marks one launch ATTEMPT, whether or not
     // it succeeds (see getContext's failure handling below).
-    const headless = isHeadless();
-    this.log(`browser launch: profile=${profile} headless=${headless}`);
+    this.log(
+      `browser launch: profile=${profile} browser=${stored.browser} headless=${headless} executable=${executableLabel}`,
+    );
 
     mkdirSync(userDataDir, { recursive: true });
     mkdirSync(downloadsDir, { recursive: true });
@@ -159,7 +244,16 @@ export class BrowserContextRouter {
       );
     }
 
-    return chromium.launchPersistentContext(userDataDir, { headless });
+    // Every supported browser (decision 4) launches through Playwright's
+    // `chromium` driver: for `chromium` itself with its bundled build (no
+    // `executablePath`), for every other Chromium-family browser by pointing
+    // that same driver at the installed executable.
+    return chromium.launchPersistentContext(userDataDir, {
+      headless,
+      ...(stored.executablePath
+        ? { executablePath: stored.executablePath }
+        : {}),
+    });
   }
 }
 
@@ -207,7 +301,7 @@ export class BrowserSession {
         `tool '${name}' requires a string 'profile' argument`,
       );
     }
-    if (profile !== HARD_CODED_PROFILE) {
+    if (!profileExists(this.router.paths, profile)) {
       throw new McpError(
         ErrorCode.InvalidParams,
         `unknown profile '${profile}'`,
@@ -239,8 +333,8 @@ export class BrowserSession {
     // Any profile's upstream connection reports the same tool set (the set
     // is fixed by our config, not by which profile is running), and asking
     // for it never touches `contextGetter`, so this never launches a
-    // browser. Use the hard-coded profile's connection.
-    const { client } = await this.getConnection(HARD_CODED_PROFILE);
+    // browser and never requires any real profile to exist.
+    const { client } = await this.getConnection(TOOLS_SCHEMA_KEY);
     const upstream = await client.listTools();
     return upstream.tools.filter((tool) => !REMOVED_TOOLS.has(tool.name));
   }
