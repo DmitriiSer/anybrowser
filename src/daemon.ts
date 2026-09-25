@@ -431,6 +431,14 @@ async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
   }
   state.sessions.clear();
 
+  // Close every open browser context (flushing its cookie store etc. to
+  // disk) BEFORE removing the socket file: a caller of `anyb stop` waits for
+  // the socket to disappear as its signal that shutdown is complete (see
+  // cli.ts's runStopCommand), so the socket must not vanish until a script
+  // that immediately inspects the profile directory afterwards sees a
+  // flushed cookie store.
+  await state.browserRouter.closeAll();
+
   try {
     unlinkSync(state.paths.socket);
   } catch (error) {

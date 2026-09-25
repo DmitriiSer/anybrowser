@@ -171,6 +171,63 @@ export class BrowserContextRouter {
   }
 
   /**
+   * Closes every open browser context so each one flushes its cookie store
+   * (and the rest of its profile state) to disk before the daemon exits: the
+   * whole point of anybrowser is that a profile stays logged in
+   * (docs/DESIGN.md decision 2), and an abrupt `process.exit()` without this
+   * kills Chromium before it ever writes the cookie it just set.
+   *
+   * Awaits every close, bounded by a few seconds per context and an overall
+   * cap of about 10 seconds, so a single hung browser can never stop the
+   * daemon from exiting: a timed-out or errored close is logged and skipped
+   * rather than retried or rethrown.
+   */
+  async closeAll(): Promise<void> {
+    const entries = [...this.runningContexts.entries()];
+    const PER_CONTEXT_TIMEOUT_MS = 3000;
+    const OVERALL_CAP_MS = 10000;
+    const overallDeadline = Date.now() + OVERALL_CAP_MS;
+
+    await Promise.all(
+      entries.map(async ([profile, context]) => {
+        const timeoutMs = Math.max(
+          0,
+          Math.min(PER_CONTEXT_TIMEOUT_MS, overallDeadline - Date.now()),
+        );
+        let timedOut = false;
+        const closePromise = context.close();
+        const timer = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            timedOut = true;
+            resolve();
+          }, timeoutMs).unref();
+        });
+        try {
+          await Promise.race([closePromise, timer]);
+          if (timedOut) {
+            this.log(`browser close timed out: profile=${profile}`);
+          } else {
+            this.log(`browser close: profile=${profile}`);
+          }
+        } catch (error) {
+          this.log(
+            `browser close failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
+          );
+        } finally {
+          // In the timeout case closePromise is still pending: attach a
+          // no-op catch so a late rejection never surfaces as an unhandled
+          // promise rejection.
+          closePromise.catch(() => {});
+        }
+      }),
+    );
+
+    this.contexts.clear();
+    this.runningContexts.clear();
+    this.runningHeadless.clear();
+  }
+
+  /**
    * Launches `profile` HEADED (unless the global ANYBROWSER_HEADLESS
    * override is set) if it isn't already running, opens `url` in a new tab
    * and brings it to front (decision 12). If the profile is already running
@@ -250,6 +307,19 @@ export class BrowserContextRouter {
     // that same driver at the installed executable.
     return chromium.launchPersistentContext(userDataDir, {
       headless,
+      // The daemon is the sole owner of browser lifetime (decision 5) and
+      // already installs its own SIGINT/SIGTERM handlers (daemon.ts) that
+      // close every context gracefully before exiting. Without these three
+      // flags, Playwright installs ITS OWN process-wide signal handlers that
+      // independently race to close the same browser process the instant a
+      // signal arrives - confirmed by a spike: on SIGTERM, Playwright's own
+      // handler and our explicit `context.close()` call both initiate a
+      // close of the same browser concurrently, and whichever tears down
+      // the browser process first can do so before the other's cookie
+      // flush lands, losing a cookie set moments earlier nondeterministically.
+      handleSIGINT: false,
+      handleSIGTERM: false,
+      handleSIGHUP: false,
       ...(stored.executablePath
         ? { executablePath: stored.executablePath }
         : {}),
