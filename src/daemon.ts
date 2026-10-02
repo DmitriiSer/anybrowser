@@ -30,6 +30,7 @@ import {
   profileExists,
   readProfile,
 } from "./profile.js";
+import { resolveIdleMs } from "./idle.js";
 
 const DAEMON_STATUS_TOOL: Tool = {
   name: "daemon_status",
@@ -127,6 +128,10 @@ interface DaemonState {
   server: NetServer;
   shuttingDown: boolean;
   browserRouter: BrowserContextRouter;
+  /** Resolved once at daemon startup (src/idle.ts); null means idling is disabled. */
+  idleMs: number | null;
+  /** Pending "exit for idleness" timer, set only while sessions.size === 0. */
+  idleExitTimer: NodeJS.Timeout | undefined;
 }
 
 function log(event: string): void {
@@ -140,7 +145,41 @@ function buildStatus(state: DaemonState): DaemonStatus {
     uptimeSeconds: (Date.now() - state.startedAt) / 1000,
     sessions: state.sessions.size,
     profiles: state.browserRouter.runningProfileIds(),
+    idleMs: state.idleMs,
   };
+}
+
+/**
+ * Clears any pending idle-exit timer, e.g. because a session just connected
+ * or the daemon is shutting down for another reason.
+ */
+function clearIdleExitTimer(state: DaemonState): void {
+  if (state.idleExitTimer !== undefined) {
+    clearTimeout(state.idleExitTimer);
+    state.idleExitTimer = undefined;
+  }
+}
+
+/**
+ * Re-arms the "exit for idleness" timer whenever sessions.size is (or just
+ * became) zero. A session connecting cancels it (see startMcpSession); this
+ * is called again on every session close so the countdown restarts from that
+ * moment, not from whenever the daemon happened to start.
+ *
+ * Idling is disabled entirely when `idleMs` is null (ANYBROWSER_IDLE_MS=off).
+ */
+function armIdleExitTimer(state: DaemonState): void {
+  clearIdleExitTimer(state);
+  if (state.idleMs === null || state.sessions.size > 0 || state.shuttingDown) {
+    return;
+  }
+  state.idleExitTimer = setTimeout(() => {
+    // Re-check at fire time: a session may have connected in the interim.
+    if (state.sessions.size === 0 && !state.shuttingDown) {
+      log(`idle exit: no sessions connected for ${state.idleMs}ms`);
+      void shutdown(state, 0);
+    }
+  }, state.idleMs);
 }
 
 /** Connects to `socketPath` just to see whether anything answers. Never throws. */
@@ -187,6 +226,7 @@ function startMcpSession(
   clientVersion: string,
 ): void {
   state.sessions.add(socket);
+  clearIdleExitTimer(state);
   log(
     `session open (client version ${clientVersion}, sessions=${state.sessions.size})`,
   );
@@ -194,6 +234,7 @@ function startMcpSession(
   socket.on("close", () => {
     state.sessions.delete(socket);
     log(`session close (sessions=${state.sessions.size})`);
+    armIdleExitTimer(state);
   });
   // No 'error' listener here: attachHelloHandler already installed the one
   // permanent listener for this socket's whole life (see its comment), so
@@ -275,12 +316,16 @@ function startMcpSession(
         }
         const stored = readProfile(state.paths, args.profile)!;
         const runningContext = state.browserRouter.runningContext(args.profile);
+        const idleForMs = state.browserRouter.idleForMs(args.profile);
         const status = {
           running: runningContext !== undefined,
           headless: stored.headless,
           browser: stored.browser,
           ...(runningContext
-            ? { tabCount: runningContext.pages().length }
+            ? {
+                tabCount: runningContext.pages().length,
+                ...(idleForMs !== undefined ? { idleForMs } : {}),
+              }
             : {}),
         };
         return { content: [{ type: "text", text: JSON.stringify(status) }] };
@@ -423,6 +468,7 @@ async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
     return;
   }
   state.shuttingDown = true;
+  clearIdleExitTimer(state);
   log("stop: shutting down");
 
   state.server.close();
@@ -463,6 +509,7 @@ export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
 
   const version = readVersion();
   const server = createServer();
+  const idleMs = resolveIdleMs(paths);
   const state: DaemonState = {
     paths,
     version,
@@ -470,8 +517,14 @@ export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
     sessions: new Set(),
     server,
     shuttingDown: false,
-    browserRouter: new BrowserContextRouter(paths, log),
+    browserRouter: new BrowserContextRouter(paths, log, idleMs),
+    idleMs,
+    idleExitTimer: undefined,
   };
+  log(`idle: idleMs=${idleMs === null ? "off" : idleMs}`);
+  // No session has connected yet, so the countdown to an idle exit starts
+  // from daemon startup itself (see armIdleExitTimer's doc comment).
+  armIdleExitTimer(state);
 
   server.on("connection", (socket) => {
     attachHelloHandler(socket, state);

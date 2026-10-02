@@ -114,17 +114,170 @@ function absolutizeSnapshotLinks(content: unknown[]): unknown[] {
 /** Thrown by `BrowserContextRouter.loginLaunch` when a profile is already running headless without the global override. */
 export class ProfileHeadlessRunningError extends Error {}
 
+/** Per-context close timeout shared by `closeAll` and a single profile's idle-close. */
+const PER_CONTEXT_CLOSE_TIMEOUT_MS = 3000;
+
 export class BrowserContextRouter {
   private readonly contexts = new Map<string, Promise<BrowserContext>>();
   /** Profiles whose launch has SUCCEEDED (a resolved context), for profile_status/profile_list/daemon_status. */
   private readonly runningContexts = new Map<string, BrowserContext>();
   /** Whether each running profile's browser is headless, for profile_login's headless-relaunch guard. */
   private readonly runningHeadless = new Map<string, boolean>();
+  /** Per-profile "browser idle close" timer (decision 5), armed by `endActivity`. */
+  private readonly idleTimers = new Map<string, NodeJS.Timeout>();
+  /** Timestamp the last tool call naming each running profile FINISHED, for `idleForMs`. */
+  private readonly lastActivity = new Map<string, number>();
+  /**
+   * Count of in-flight tool calls naming each profile. While this is above
+   * zero the idle-close timer is held off entirely, so a single slow call
+   * (e.g. a slow page load) can never be mistaken for idleness and close
+   * the browser out from under it - only cleared, silent time between calls
+   * counts towards the idle window.
+   */
+  private readonly activeCalls = new Map<string, number>();
+  /**
+   * Bumped every time a profile's context is closed (idle-close or
+   * `closeAll`), so a `BrowserSession`'s cached embedded MCP connection for
+   * that profile (which is keyed on this generation) is dropped and
+   * recreated on the next call instead of reusing a connection bound to a
+   * now-closed context.
+   */
+  private readonly generations = new Map<string, number>();
 
   constructor(
     readonly paths: AnybrowserPaths,
     private readonly log: (event: string) => void,
+    /** Resolved once at daemon startup (src/idle.ts); null disables per-profile idle close. */
+    private readonly idleMs: number | null,
   ) {}
+
+  /** Current generation number for `profile` (see `generations` above). Defaults to 0. */
+  generationOf(profile: string): number {
+    return this.generations.get(profile) ?? 0;
+  }
+
+  private bumpGeneration(profile: string): void {
+    this.generations.set(profile, this.generationOf(profile) + 1);
+  }
+
+  /** Milliseconds since the last tool call naming `profile`, or undefined if it isn't running. */
+  idleForMs(profile: string): number | undefined {
+    const last = this.lastActivity.get(profile);
+    return last === undefined ? undefined : Date.now() - last;
+  }
+
+  private clearIdleTimer(profile: string): void {
+    const timer = this.idleTimers.get(profile);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      this.idleTimers.delete(profile);
+    }
+  }
+
+  /** (Re-)arms the idle-close timer for `profile`, cancelling any previous one. A no-op when idling is disabled. */
+  private armIdleTimer(profile: string): void {
+    this.clearIdleTimer(profile);
+    if (this.idleMs === null) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void this.closeIdleProfile(profile);
+    }, this.idleMs);
+    this.idleTimers.set(profile, timer);
+  }
+
+  /**
+   * Marks the start of one tool call naming `profile`: holds off the
+   * idle-close timer until every in-flight call for this profile has
+   * finished (see `activeCalls`'s doc comment). Call on every browser tool
+   * call and on `profile_login`, paired with `endActivity`.
+   */
+  beginActivity(profile: string): void {
+    this.clearIdleTimer(profile);
+    this.activeCalls.set(profile, (this.activeCalls.get(profile) ?? 0) + 1);
+  }
+
+  /**
+   * Marks the end of one tool call naming `profile`. Once the last
+   * concurrent call for this profile finishes, records the current time as
+   * its last activity and (re)arms the idle-close timer counting forward
+   * from now - never from before the call started.
+   */
+  endActivity(profile: string): void {
+    const remaining = Math.max(0, (this.activeCalls.get(profile) ?? 1) - 1);
+    if (remaining > 0) {
+      this.activeCalls.set(profile, remaining);
+      return;
+    }
+    this.activeCalls.delete(profile);
+    this.lastActivity.set(profile, Date.now());
+    this.armIdleTimer(profile);
+  }
+
+  /**
+   * Closes one profile's browser because it has been idle for `idleMs` with
+   * no tool call naming it (decision 5), reusing the same graceful close
+   * path as `closeAll` (so the cookie store is flushed - a profile that is
+   * idle-closed must keep its logins). The profile relaunches lazily on its
+   * next tool call, exactly like a profile that has never been launched.
+   *
+   * Evicts the profile from the launch cache BEFORE awaiting the close, so
+   * a tool call racing this idle-close triggers a fresh launch rather than
+   * reusing a context that is mid-close.
+   */
+  private async closeIdleProfile(profile: string): Promise<void> {
+    const context = this.runningContexts.get(profile);
+    if (!context) {
+      return; // already closed by other means (e.g. daemon shutdown)
+    }
+    this.clearIdleTimer(profile);
+    this.lastActivity.delete(profile);
+    this.activeCalls.delete(profile);
+    this.contexts.delete(profile);
+    this.runningContexts.delete(profile);
+    this.runningHeadless.delete(profile);
+    this.bumpGeneration(profile);
+    await this.closeOneContext(profile, context, PER_CONTEXT_CLOSE_TIMEOUT_MS);
+  }
+
+  /**
+   * Closes one browser context, bounded by `timeoutMs`, logging exactly one
+   * of `browser close: profile=...`, `browser close timed out: profile=...`
+   * or `browser close failed: profile=... error=...`. Shared by `closeAll`
+   * and `closeIdleProfile` so both reuse the identical graceful-close
+   * behaviour (decision 2: a profile must keep its logins across either
+   * path).
+   */
+  private async closeOneContext(
+    profile: string,
+    context: BrowserContext,
+    timeoutMs: number,
+  ): Promise<void> {
+    let timedOut = false;
+    const closePromise = context.close();
+    const timer = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, timeoutMs).unref();
+    });
+    try {
+      await Promise.race([closePromise, timer]);
+      if (timedOut) {
+        this.log(`browser close timed out: profile=${profile}`);
+      } else {
+        this.log(`browser close: profile=${profile}`);
+      }
+    } catch (error) {
+      this.log(
+        `browser close failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      // In the timeout case closePromise is still pending: attach a no-op
+      // catch so a late rejection never surfaces as an unhandled rejection.
+      closePromise.catch(() => {});
+    }
+  }
 
   /**
    * Returns the shared persistent context for `profile`, launching it on
@@ -184,47 +337,28 @@ export class BrowserContextRouter {
    */
   async closeAll(): Promise<void> {
     const entries = [...this.runningContexts.entries()];
-    const PER_CONTEXT_TIMEOUT_MS = 3000;
     const OVERALL_CAP_MS = 10000;
     const overallDeadline = Date.now() + OVERALL_CAP_MS;
+
+    for (const profile of this.idleTimers.keys()) {
+      this.clearIdleTimer(profile);
+    }
 
     await Promise.all(
       entries.map(async ([profile, context]) => {
         const timeoutMs = Math.max(
           0,
-          Math.min(PER_CONTEXT_TIMEOUT_MS, overallDeadline - Date.now()),
+          Math.min(PER_CONTEXT_CLOSE_TIMEOUT_MS, overallDeadline - Date.now()),
         );
-        let timedOut = false;
-        const closePromise = context.close();
-        const timer = new Promise<void>((resolve) => {
-          setTimeout(() => {
-            timedOut = true;
-            resolve();
-          }, timeoutMs).unref();
-        });
-        try {
-          await Promise.race([closePromise, timer]);
-          if (timedOut) {
-            this.log(`browser close timed out: profile=${profile}`);
-          } else {
-            this.log(`browser close: profile=${profile}`);
-          }
-        } catch (error) {
-          this.log(
-            `browser close failed: profile=${profile} error=${error instanceof Error ? error.message : String(error)}`,
-          );
-        } finally {
-          // In the timeout case closePromise is still pending: attach a
-          // no-op catch so a late rejection never surfaces as an unhandled
-          // promise rejection.
-          closePromise.catch(() => {});
-        }
+        this.bumpGeneration(profile);
+        await this.closeOneContext(profile, context, timeoutMs);
       }),
     );
 
     this.contexts.clear();
     this.runningContexts.clear();
     this.runningHeadless.clear();
+    this.lastActivity.clear();
   }
 
   /**
@@ -249,9 +383,14 @@ export class BrowserContextRouter {
     } else {
       context = await this.getContext(profile, isHeadless());
     }
-    const page = await context.newPage();
-    await page.goto(url);
-    await page.bringToFront();
+    this.beginActivity(profile);
+    try {
+      const page = await context.newPage();
+      await page.goto(url);
+      await page.bringToFront();
+    } finally {
+      this.endActivity(profile);
+    }
   }
 
   private async launch(
@@ -344,6 +483,8 @@ interface UpstreamConnection {
 export class BrowserSession {
   private toolsPromise: Promise<Tool[]> | undefined;
   private readonly connections = new Map<string, Promise<UpstreamConnection>>();
+  /** The router generation each cached connection was opened at (see `BrowserContextRouter.generationOf`). */
+  private readonly connectionGenerations = new Map<string, number>();
 
   constructor(private readonly router: BrowserContextRouter) {}
 
@@ -377,26 +518,31 @@ export class BrowserSession {
         `unknown profile '${profile}'`,
       );
     }
-    const connection = await this.getConnection(profile);
-    if (!connection.tabOpened) {
-      // Every new embedded connection starts on the shared context's FIRST
-      // page (verified in the design spike), so without this, two sessions
-      // would share one tab and overwrite each other's navigation. Opening
-      // a fresh tab through the upstream tool surface (rather than touching
-      // Playwright directly) keeps upstream's own "current tab" bookkeeping
-      // correct (decision 10).
-      await connection.client.callTool({
-        name: "browser_tabs",
-        arguments: { action: "new" },
+    this.router.beginActivity(profile);
+    try {
+      const connection = await this.getConnection(profile);
+      if (!connection.tabOpened) {
+        // Every new embedded connection starts on the shared context's
+        // FIRST page (verified in the design spike), so without this, two
+        // sessions would share one tab and overwrite each other's
+        // navigation. Opening a fresh tab through the upstream tool surface
+        // (rather than touching Playwright directly) keeps upstream's own
+        // "current tab" bookkeeping correct (decision 10).
+        await connection.client.callTool({
+          name: "browser_tabs",
+          arguments: { action: "new" },
+        });
+        connection.tabOpened = true;
+      }
+      const result = await connection.client.callTool({
+        name,
+        arguments: upstreamArgs,
       });
-      connection.tabOpened = true;
+      const typed = result as { content: unknown[]; isError?: boolean };
+      return { ...typed, content: absolutizeSnapshotLinks(typed.content) };
+    } finally {
+      this.router.endActivity(profile);
     }
-    const result = await connection.client.callTool({
-      name,
-      arguments: upstreamArgs,
-    });
-    const typed = result as { content: unknown[]; isError?: boolean };
-    return { ...typed, content: absolutizeSnapshotLinks(typed.content) };
   }
 
   private async fetchUpstreamTools(): Promise<Tool[]> {
@@ -410,8 +556,17 @@ export class BrowserSession {
   }
 
   private getConnection(profile: string): Promise<UpstreamConnection> {
+    // A profile idle-closed (or closed by daemon shutdown) since this
+    // connection was opened bumps its generation at the router: drop the
+    // stale connection (bound to a now-closed context) so the call below
+    // opens a fresh one over the profile's freshly relaunched context.
+    const currentGeneration = this.router.generationOf(profile);
+    if (this.connectionGenerations.get(profile) !== currentGeneration) {
+      this.connections.delete(profile);
+    }
     let connection = this.connections.get(profile);
     if (!connection) {
+      this.connectionGenerations.set(profile, currentGeneration);
       // A failed open (e.g. the underlying browser launch failed) must not
       // be cached forever: evict it so the next call retries (same reasoning
       // as BrowserContextRouter.getContext; the launch failure itself is

@@ -27,6 +27,8 @@ export interface DaemonStatus {
   uptimeSeconds: number;
   sessions: number;
   profiles: unknown[];
+  /** Resolved idle timeout in ms (src/idle.ts), or null when idling is disabled. */
+  idleMs: number | null;
 }
 
 export function isHelloRole(value: unknown): value is HelloRole {

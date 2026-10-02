@@ -21,6 +21,12 @@ function makeFakeApp(appsDir: string, relativePath: string): string {
   return fullPath;
 }
 
+// Matches the timeout used by other process-spawning tests in this repo
+// (e.g. test/daemon.test.ts, test/cookie-survival.browser.test.ts): a test
+// that spawns the CLI more than once can exceed vitest's default 5000ms on a
+// loaded CI runner even though each spawn is fast locally.
+const SPAWN_TIMEOUT = 30000;
+
 let home: string;
 
 beforeEach(() => {
@@ -32,35 +38,39 @@ afterEach(() => {
 });
 
 describe("anyb profile list", () => {
-  it("prints 'no profiles' when there are none, and one line per profile (id, browser, headless) after adding", () => {
-    const empty = runCli(["profile", "list"], home);
-    expect(empty.status).toBe(0);
-    expect(empty.stdout.trim()).toBe("no profiles");
+  it(
+    "prints 'no profiles' when there are none, and one line per profile (id, browser, headless) after adding",
+    () => {
+      const empty = runCli(["profile", "list"], home);
+      expect(empty.status).toBe(0);
+      expect(empty.stdout.trim()).toBe("no profiles");
 
-    runCli(["profile", "add", "work", "chromium"], home);
-    runCli(["profile", "add", "docs", "chromium", "--headless"], home);
+      runCli(["profile", "add", "work", "chromium"], home);
+      runCli(["profile", "add", "docs", "chromium", "--headless"], home);
 
-    const result = runCli(["profile", "list"], home);
-    expect(result.status).toBe(0);
-    const lines = result.stdout.trim().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(
-      lines.some(
-        (l) =>
-          l.includes("docs-in-chromium") &&
-          l.includes("chromium") &&
-          l.includes("true"),
-      ),
-    ).toBe(true);
-    expect(
-      lines.some(
-        (l) =>
-          l.includes("work-in-chromium") &&
-          l.includes("chromium") &&
-          l.includes("false"),
-      ),
-    ).toBe(true);
-  });
+      const result = runCli(["profile", "list"], home);
+      expect(result.status).toBe(0);
+      const lines = result.stdout.trim().split("\n");
+      expect(lines).toHaveLength(2);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("docs-in-chromium") &&
+            l.includes("chromium") &&
+            l.includes("true"),
+        ),
+      ).toBe(true);
+      expect(
+        lines.some(
+          (l) =>
+            l.includes("work-in-chromium") &&
+            l.includes("chromium") &&
+            l.includes("false"),
+        ),
+      ).toBe(true);
+    },
+    SPAWN_TIMEOUT,
+  );
 });
 
 describe("anyb profile add", () => {
@@ -110,13 +120,17 @@ describe("anyb profile add", () => {
     expect(result.stderr).toMatch(/not supported yet/);
   });
 
-  it("exits 1 when the id already exists", () => {
-    const first = runCli(["profile", "add", "work", "chromium"], home);
-    expect(first.status).toBe(0);
-    const second = runCli(["profile", "add", "work", "chromium"], home);
-    expect(second.status).toBe(1);
-    expect(second.stderr).toMatch(/work-in-chromium/);
-  });
+  it(
+    "exits 1 when the id already exists",
+    () => {
+      const first = runCli(["profile", "add", "work", "chromium"], home);
+      expect(first.status).toBe(0);
+      const second = runCli(["profile", "add", "work", "chromium"], home);
+      expect(second.status).toBe(1);
+      expect(second.stderr).toMatch(/work-in-chromium/);
+    },
+    SPAWN_TIMEOUT,
+  );
 });
 
 describe("anyb profile add for an installed (non-chromium) browser", () => {
@@ -162,15 +176,19 @@ describe("anyb profile add for an installed (non-chromium) browser", () => {
 });
 
 describe("anyb profile remove", () => {
-  it("deletes the profile directory when the daemon is not running", () => {
-    runCli(["profile", "add", "work", "chromium"], home);
-    const dir = join(home, "profiles", "work-in-chromium");
-    expect(existsSync(dir)).toBe(true);
+  it(
+    "deletes the profile directory when the daemon is not running",
+    () => {
+      runCli(["profile", "add", "work", "chromium"], home);
+      const dir = join(home, "profiles", "work-in-chromium");
+      expect(existsSync(dir)).toBe(true);
 
-    const result = runCli(["profile", "remove", "work-in-chromium"], home);
-    expect(result.status).toBe(0);
-    expect(existsSync(dir)).toBe(false);
-  });
+      const result = runCli(["profile", "remove", "work-in-chromium"], home);
+      expect(result.status).toBe(0);
+      expect(existsSync(dir)).toBe(false);
+    },
+    SPAWN_TIMEOUT,
+  );
 
   it("exits 1 when the profile does not exist", () => {
     const result = runCli(["profile", "remove", "no-such-in-chromium"], home);
@@ -180,40 +198,53 @@ describe("anyb profile remove", () => {
 });
 
 describe("anyb profile set", () => {
-  it("updates headless in profile.json", () => {
-    runCli(["profile", "add", "work", "chromium"], home);
-    const jsonPath = join(home, "profiles", "work-in-chromium", "profile.json");
-    expect(
-      (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
-        .headless,
-    ).toBe(false);
+  it(
+    "updates headless in profile.json",
+    () => {
+      runCli(["profile", "add", "work", "chromium"], home);
+      const jsonPath = join(
+        home,
+        "profiles",
+        "work-in-chromium",
+        "profile.json",
+      );
+      expect(
+        (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
+          .headless,
+      ).toBe(false);
 
-    const result = runCli(
-      ["profile", "set", "work-in-chromium", "headless=true"],
-      home,
-    );
-    expect(result.status).toBe(0);
-    expect(
-      (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
-        .headless,
-    ).toBe(true);
+      const result = runCli(
+        ["profile", "set", "work-in-chromium", "headless=true"],
+        home,
+      );
+      expect(result.status).toBe(0);
+      expect(
+        (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
+          .headless,
+      ).toBe(true);
 
-    runCli(["profile", "set", "work-in-chromium", "headless=false"], home);
-    expect(
-      (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
-        .headless,
-    ).toBe(false);
-  });
+      runCli(["profile", "set", "work-in-chromium", "headless=false"], home);
+      expect(
+        (JSON.parse(readFileSync(jsonPath, "utf8")) as { headless: boolean })
+          .headless,
+      ).toBe(false);
+    },
+    SPAWN_TIMEOUT,
+  );
 
-  it("exits 2 for an unknown key", () => {
-    runCli(["profile", "add", "work", "chromium"], home);
-    const result = runCli(
-      ["profile", "set", "work-in-chromium", "browser=brave"],
-      home,
-    );
-    expect(result.status).toBe(2);
-    expect(result.stderr).toMatch(/browser/);
-  });
+  it(
+    "exits 2 for an unknown key",
+    () => {
+      runCli(["profile", "add", "work", "chromium"], home);
+      const result = runCli(
+        ["profile", "set", "work-in-chromium", "browser=brave"],
+        home,
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).toMatch(/browser/);
+    },
+    SPAWN_TIMEOUT,
+  );
 });
 
 describe("anyb profile login argument validation", () => {
