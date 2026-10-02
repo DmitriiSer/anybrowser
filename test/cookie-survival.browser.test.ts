@@ -94,6 +94,21 @@ function findCookiesFile(home: string, profileId: string): string | null {
   return null;
 }
 
+/**
+ * Raw bytes of the cookie store, including its write-ahead log and rollback
+ * journal siblings when they exist. SQLite may leave a just-committed row in
+ * `-wal` rather than the main database file, and whether it has been
+ * checkpointed by the time the browser exits differs between platforms (seen
+ * on the Linux CI runner but not on macOS). The row is flushed to durable
+ * storage either way, so the assertion looks across all of them.
+ */
+function readCookieStoreBytes(cookiesFile: string): string {
+  return [cookiesFile, `${cookiesFile}-wal`, `${cookiesFile}-journal`]
+    .filter((candidate) => existsSync(candidate))
+    .map((candidate) => readFileSync(candidate, "latin1"))
+    .join("");
+}
+
 const SPAWN_TIMEOUT = 30000;
 
 let home: string;
@@ -252,7 +267,7 @@ describe("anyb stop does not return before the browser is closed", () => {
         // actual cookie row.
         const cookiesFile = findCookiesFile(home, id);
         expect(cookiesFile).not.toBeNull();
-        const raw = readFileSync(cookiesFile!, "latin1");
+        const raw = readCookieStoreBytes(cookiesFile!);
         expect(raw).toContain(COOKIE_NAME);
       } finally {
         await pageServer.close();
