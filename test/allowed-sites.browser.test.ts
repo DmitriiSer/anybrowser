@@ -15,6 +15,7 @@ import {
   makeHome,
   runCli,
   runCliAsync,
+  waitFor,
 } from "./support.js";
 
 const SPAWN_TIMEOUT = 30000;
@@ -1186,6 +1187,122 @@ describe("what an entry covers", () => {
         ).toBe(true);
       } finally {
         await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("the same refused host again and again", () => {
+  const explained = (result: unknown) => {
+    const text = textOf(result as never);
+    return (
+      (result as { isError?: boolean }).isError === true &&
+      /allowed-sites list/.test(text) &&
+      text.includes("https://localhost:8443/")
+    );
+  };
+
+  it(
+    "explains the refusal every time within one session",
+    async () => {
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+      const { client, close } = await connectClient(home);
+      try {
+        for (let round = 0; round < 4; round++) {
+          const blocked = await client.callTool({
+            name: "browser_navigate",
+            arguments: {
+              profile: "pinned-in-chromium",
+              url: "https://localhost:8443/",
+            },
+          });
+          expect(
+            explained(blocked),
+            `round ${round}: ${textOf(blocked as never)}`,
+          ).toBe(true);
+        }
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "explains it even when an earlier refusal of that host was never claimed by any event (a blocked WebSocket emits none)",
+    async () => {
+      const allowed = await site("127.0.0.1", "Allowed page", (req, res) => {
+        if (req.url !== "/socket") {
+          return false;
+        }
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end(
+          '<title>Socket</title><script>try { new WebSocket("wss://localhost:8443/ws"); } catch (e) {}</script>',
+        );
+        return true;
+      });
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+      const { client, close } = await connectClient(home);
+      try {
+        const go = (url: string) =>
+          client.callTool({
+            name: "browser_navigate",
+            arguments: { profile: "pinned-in-chromium", url },
+          });
+        await go(`${allowed.url}/socket`);
+        // The unclaimed refusal exists before the call under test.
+        await waitFor(() => /blocked: .*localhost:8443/.test(daemonLog()));
+        for (let round = 0; round < 2; round++) {
+          const blocked = await go("https://localhost:8443/");
+          expect(
+            explained(blocked),
+            `round ${round}: ${textOf(blocked as never)}`,
+          ).toBe(true);
+        }
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "explains the refusal in a second session on the same daemon and profile",
+    async () => {
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+      for (let session = 0; session < 3; session++) {
+        const { client, close } = await connectClient(home);
+        try {
+          const blocked = await client.callTool({
+            name: "browser_navigate",
+            arguments: {
+              profile: "pinned-in-chromium",
+              url: "https://localhost:8443/",
+            },
+          });
+          expect(
+            explained(blocked),
+            `session ${session}: ${textOf(blocked as never)}`,
+          ).toBe(true);
+        } finally {
+          await close();
+        }
       }
     },
     SPAWN_TIMEOUT,

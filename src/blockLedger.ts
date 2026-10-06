@@ -85,7 +85,7 @@ export class BlockLedger {
 
   /**
    * A failed request whose URL names a destination the proxy refused a
-   * CONNECT to (https, wss, or a ws tunnel). Claims the oldest unclaimed
+   * CONNECT to (https, wss, or a ws tunnel). Claims the newest unclaimed
    * refusal for it; returns false when there is none, i.e. the failure was
    * not a refusal.
    */
@@ -97,11 +97,9 @@ export class BlockLedger {
     if (wanted === null) {
       return false;
     }
-    const entry = this.entries.find(
+    const entry = this.newestUnclaimed(
       (e) =>
-        e.claim === undefined &&
-        e.refusal.kind === "connect" &&
-        authorityOf(e.refusal.url) === wanted,
+        e.refusal.kind === "connect" && authorityOf(e.refusal.url) === wanted,
     );
     if (!entry) {
       return false;
@@ -111,17 +109,14 @@ export class BlockLedger {
     return true;
   }
 
-  /** A response carrying the proxy's block header for `url`; claims the matching plain-HTTP refusal. */
+  /** A response carrying the proxy's block header for `url`; claims the newest matching plain-HTTP refusal. */
   claimHttp(
     url: string,
     attribution: (refusedAt: number) => BlockAttribution,
   ): boolean {
     const wanted = hrefOf(url);
-    const entry = this.entries.find(
-      (e) =>
-        e.claim === undefined &&
-        e.refusal.kind === "http" &&
-        hrefOf(e.refusal.url) === wanted,
+    const entry = this.newestUnclaimed(
+      (e) => e.refusal.kind === "http" && hrefOf(e.refusal.url) === wanted,
     );
     if (!entry) {
       return false;
@@ -129,6 +124,18 @@ export class BlockLedger {
     entry.claim = attribution(entry.refusal.at);
     this.notify();
     return true;
+  }
+
+  /**
+   * The NEWEST unclaimed refusal matching `matches`. An event trails its own
+   * refusal by moments, so the newest match is the one it describes; older
+   * unclaimed ones (a blocked WebSocket or the browser's own traffic emits no
+   * event, ever) are stale and must not shadow it.
+   */
+  private newestUnclaimed(
+    matches: (entry: LedgerEntry) => boolean,
+  ): LedgerEntry | undefined {
+    return this.entries.findLast((e) => e.claim === undefined && matches(e));
   }
 
   /** Entries refused after `mark`, oldest first. */
