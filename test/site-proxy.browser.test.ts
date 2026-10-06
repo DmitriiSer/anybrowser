@@ -205,7 +205,7 @@ describe("a subresource the list refuses", () => {
         res.writeHead(200, { "content-type": "text/html" });
         res.end(
           `<title>Start</title><h1>Start</h1><script src="${other.url}/lib.js"></script>` +
-            // The same refusal three times is reported once.
+            // Four refused requests to one host are reported as one host.
             `<script>for (let i = 0; i < 3; i++) fetch('${other.url}/same').catch(() => {});</script>`,
         );
         return true;
@@ -215,9 +215,9 @@ describe("a subresource the list refuses", () => {
         const nav = await navigate(client, allowed.url);
         const text = textOf(nav as never);
         expect(nav.isError, text).toBeFalsy();
-        expect(text).toContain(`${other.url}/lib.js`);
+        // The note names the host, once, however many requests it refused.
+        expect(text.split(new URL(other.url).host)).toHaveLength(2);
         expect(text).toMatch(/allowed-sites list/);
-        expect(text.split(`${other.url}/same`)).toHaveLength(2);
 
         // A page that asks for it with fetch sees a 403 it can read, not a bare network error.
         const seen = await evaluate(

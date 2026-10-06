@@ -899,7 +899,7 @@ describe("a click that leads off the list", () => {
         const text = textOf(nav as never);
         expect(nav.isError, text).toBeFalsy();
         expect(text).toContain("Start");
-        expect(text).toContain(`${other.url}/pixel.png`);
+        expect(text).toContain(new URL(other.url).host);
         expect(text).toMatch(/allowed-sites list/);
       } finally {
         await close();
@@ -1303,6 +1303,195 @@ describe("the same refused host again and again", () => {
         } finally {
           await close();
         }
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("a page that loads but whose subresources are refused", () => {
+  /** Serves `html` from an allowed site, pins a profile to it, and returns the result of loading it. */
+  async function loadPinned(html: string, pinned = true) {
+    const allowed = await site("127.0.0.1", "Allowed page", (req, res) => {
+      if (req.url !== "/") {
+        return false;
+      }
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(html);
+      return true;
+    });
+    expect(
+      runCli(
+        [
+          "profile",
+          "add",
+          "pinned",
+          "chromium",
+          ...(pinned ? ["--allow", "127.0.0.1:*"] : []),
+        ],
+        home,
+      ).status,
+    ).toBe(0);
+    const { client, close } = await connectClient(home);
+    try {
+      return await client.callTool({
+        name: "browser_navigate",
+        arguments: { profile: "pinned-in-chromium", url: allowed.url },
+      });
+    } finally {
+      await close();
+    }
+  }
+
+  it(
+    "succeeds, names the unlisted host and says the page may be incomplete",
+    async () => {
+      const other = await site("localhost", "Other page");
+      const otherHost = new URL(other.url).host;
+      const nav = await loadPinned(
+        `<title>Start</title><h1>Start</h1><script src="${other.url}/app.js"></script>`,
+      );
+      const text = textOf(nav as never);
+      expect(nav.isError, text).toBeFalsy();
+      expect(text).toContain("Start");
+      expect(text).toContain(otherHost);
+      expect(text).not.toContain("/app.js");
+      expect(text).toMatch(/may be incomplete/);
+      expect(text).toMatch(/only the user can change/i);
+      expect(text).not.toMatch(/anyb profile set/);
+    },
+    SPAWN_TIMEOUT,
+  );
+  it(
+    "names a host once however many of its requests were refused",
+    async () => {
+      const other = await site("localhost", "Other page");
+      const otherHost = new URL(other.url).host;
+      const images = Array.from(
+        { length: 20 },
+        (_, i) => `<img src="${other.url}/p${i}.png">`,
+      ).join("");
+      const nav = await loadPinned(`<title>Many</title>${images}`);
+      const text = textOf(nav as never);
+      expect(nav.isError, text).toBeFalsy();
+      expect(text.split(otherHost)).toHaveLength(2);
+      expect(text).not.toMatch(/more/);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "names several hosts, and counts the rest beyond five",
+    async () => {
+      const hosts = Array.from({ length: 8 }, (_, i) => `h${i}.example.com`);
+      const scripts = hosts
+        .toReversed()
+        .map((h) => `<script src="https://${h}/x.js"></script>`)
+        .join("");
+      const nav = await loadPinned(`<title>Hosts</title>${scripts}`);
+      const text = textOf(nav as never);
+      expect(nav.isError, text).toBeFalsy();
+      expect(text).toContain(
+        "h0.example.com, h1.example.com, h2.example.com, h3.example.com, h4.example.com and 3 more",
+      );
+      expect(text).not.toContain("h5.example.com");
+    },
+    SPAWN_TIMEOUT,
+  );
+  it(
+    "says nothing on a profile without a list",
+    async () => {
+      const other = await site("localhost", "Other page");
+      const nav = await loadPinned(
+        `<title>Open</title><script src="${other.url}/app.js"></script>`,
+        false,
+      );
+      const text = textOf(nav as never);
+      expect(nav.isError, text).toBeFalsy();
+      expect(text).not.toMatch(/### Blocked|incomplete|allowed-sites/);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "says nothing for a refusal that no event attributes to the page (a blocked WebSocket)",
+    async () => {
+      const nav = await loadPinned(
+        '<title>Socket</title><script>try { new WebSocket("wss://localhost:8443/ws"); } catch (e) {}</script>',
+      );
+      // The refusal exists, so silence is not just an absent refusal.
+      await waitFor(() => /blocked: .*localhost:8443/.test(daemonLog()));
+      const text = textOf(nav as never);
+      expect(nav.isError, text).toBeFalsy();
+      expect(text).not.toMatch(/### Blocked|incomplete|allowed-sites/);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "keeps the error for a blocked top-level navigation, with no subresource note",
+    async () => {
+      const other = await site("localhost", "Other page");
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+      const { client, close } = await connectClient(home);
+      try {
+        const nav = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "pinned-in-chromium", url: other.url },
+        });
+        const text = textOf(nav as never);
+        expect(nav.isError, text).toBe(true);
+        expect(text).toContain(`Blocked: ${other.url}`);
+        expect(text).toMatch(/allowed-sites list/);
+        expect(text).not.toMatch(/incomplete|### Blocked/);
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+  it(
+    "reports a request refused after the load, on the next call",
+    async () => {
+      const allowed = await site("127.0.0.1", "Allowed page", (req, res) => {
+        if (req.url !== "/") {
+          return false;
+        }
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end(
+          '<title>Late</title><h1>Late</h1><script>setTimeout(() => { const s = document.createElement("script"); s.src = "https://late.example.com/l.js"; document.head.append(s); }, 2500);</script>',
+        );
+        return true;
+      });
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+      const { client, close } = await connectClient(home);
+      try {
+        const nav = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "pinned-in-chromium", url: allowed.url },
+        });
+        expect(textOf(nav as never)).not.toContain("late.example.com");
+        await waitFor(() => /blocked: .*late\.example\.com/.test(daemonLog()));
+        const snap = await client.callTool({
+          name: "browser_snapshot",
+          arguments: { profile: "pinned-in-chromium" },
+        });
+        const text = textOf(snap as never);
+        expect(snap.isError, text).toBeFalsy();
+        expect(text).toContain("late.example.com");
+        expect(text).toMatch(/may be incomplete/);
+      } finally {
+        await close();
       }
     },
     SPAWN_TIMEOUT,

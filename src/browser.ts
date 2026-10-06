@@ -143,6 +143,42 @@ function blockedMessage(
   );
 }
 
+/** The most hosts a subresource note names before it counts the rest. */
+const MAX_NOTED_HOSTS = 5;
+
+/**
+ * The note for a page that loaded while requests it made were refused. It
+ * names distinct hosts (with the port when it is not the scheme's default,
+ * since the list needs it written out), sorted so the text is stable, and
+ * never says how to change the list.
+ */
+function incompletePageMessage(
+  profile: string,
+  allowedOrigins: string[],
+  urls: string[],
+): string {
+  const hosts = new Set<string>();
+  for (const url of urls) {
+    try {
+      hosts.add(new URL(url).host);
+    } catch {
+      // Not a URL; there is no host to name.
+    }
+  }
+  const sorted = [...hosts].sort();
+  const shown = sorted.slice(0, MAX_NOTED_HOSTS).join(", ");
+  const named =
+    sorted.length > MAX_NOTED_HOSTS
+      ? `${shown} and ${sorted.length - MAX_NOTED_HOSTS} more`
+      : shown;
+  return (
+    `The page loaded but may be incomplete: requests it made to ${named} were refused. ` +
+    `Profile '${profile}' is restricted to an allowed-sites list (${allowedOrigins.join(", ")}), and these hosts would need to be on it. ` +
+    `Only the user can change that list; do not try to change it or get around it. ` +
+    `If the page needs them, tell the user.`
+  );
+}
+
 /** `url` without its query and fragment, for the log: those are where tokens live. */
 function loggableUrl(url: string): string {
   try {
@@ -464,13 +500,13 @@ export class BrowserContextRouter {
   async blocksSince(
     profile: string,
     mark: number,
-  ): Promise<BlockAttribution[]> {
+  ): Promise<Array<BlockAttribution & { seq: number }>> {
     const ledger = this.ledgerFor(profile);
     await ledger.whenClaimed(mark, CLAIM_WAIT_MS);
-    const blocks: BlockAttribution[] = [];
+    const blocks: Array<BlockAttribution & { seq: number }> = [];
     for (const entry of ledger.since(mark)) {
       if (entry.claim) {
-        blocks.push(entry.claim);
+        blocks.push({ ...entry.claim, seq: entry.seq });
       }
     }
     return blocks;
@@ -869,6 +905,12 @@ interface UpstreamConnection {
   client: Client;
   /** Whether this connection has already opened its own fresh tab (decision 10). */
   tabOpened: boolean;
+  /**
+   * The ledger position up to which this session has already been told about
+   * refused subresources. A page keeps loading between calls, so what a call
+   * reports starts here, not at the call's own start.
+   */
+  noteMark?: number;
 }
 
 /**
@@ -957,7 +999,11 @@ export class BrowserSession {
       const typed = result as { content: unknown[]; isError?: boolean };
       const content = absolutizeSnapshotLinks(typed.content);
       const allowedOrigins = this.router.currentAllowedOrigins(profile);
-      const blocks = await this.router.blocksSince(profile, mark);
+      const blocks = await this.router.blocksSince(
+        profile,
+        connection.noteMark ?? mark,
+      );
+      connection.noteMark = this.router.blockMark(profile);
       if (blocks.length === 0 || !allowedOrigins?.length) {
         return { ...typed, content };
       }
@@ -967,6 +1013,10 @@ export class BrowserSession {
       const own: BlockAttribution[] = [];
       const notes: BlockAttribution[] = [];
       for (const block of blocks) {
+        if (block.navigation && block.seq <= mark) {
+          // Refused between calls: no call's navigation, so not an error.
+          continue;
+        }
         if (block.page !== null && block.page === ownPage) {
           (block.navigation ? own : notes).push(block);
         } else if (
@@ -982,21 +1032,27 @@ export class BrowserSession {
       // The tab is mid-way to what replaces it; the caller's next navigation
       // would race it (see BrowserContextRouter.whenReplaced).
       await Promise.all(own.map((b) => b.settled));
-      const shown = describeUrls([...own, ...notes]);
-      const message = blockedMessage(profile, allowedOrigins, shown);
       if (own.length > 0) {
+        const shown = describeUrls([...own, ...notes]);
         return {
           ...typed,
           isError: true,
-          content: [{ type: "text", text: `### Error\n${message}` }],
+          content: [
+            {
+              type: "text",
+              text: `### Error\n${blockedMessage(profile, allowedOrigins, shown)}`,
+            },
+          ],
         };
       }
+      const note = incompletePageMessage(
+        profile,
+        allowedOrigins,
+        notes.map((b) => b.url),
+      );
       return {
         ...typed,
-        content: [
-          ...content,
-          { type: "text", text: `### Blocked\n${message}` },
-        ],
+        content: [...content, { type: "text", text: `### Blocked\n${note}` }],
       };
     } finally {
       this.router.endActivity(profile);
