@@ -386,8 +386,10 @@ describe("anyb profile list and allowed sites", () => {
       const lines = result.stdout.trim().split("\n");
       const pinned = lines.find((l) => l.startsWith("pinned-in-chromium"));
       const open = lines.find((l) => l.startsWith("open-in-chromium"));
-      expect(pinned).toContain("allowed=example.com,*.example.com");
-      expect(open).toBe("open-in-chromium  chromium  headless=false");
+      // The list is a column of the table, and an unrestricted profile
+      // shows a dash there.
+      expect(pinned).toMatch(/example\.com,\*\.example\.com$/);
+      expect(open).toMatch(/^open-in-chromium\s+chromium\s+false\s+-$/);
     },
     SPAWN_TIMEOUT,
   );

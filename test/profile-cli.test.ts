@@ -39,6 +39,48 @@ afterEach(() => {
 
 describe("anyb profile list", () => {
   it(
+    "prints a titled, column-aligned table",
+    () => {
+      runCli(["profile", "add", "work", "chromium"], home);
+      runCli(
+        [
+          "profile",
+          "add",
+          "docs",
+          "chromium",
+          "--headless",
+          "--allow",
+          "example.com",
+        ],
+        home,
+      );
+
+      const result = runCli(["profile", "list"], home);
+      expect(result.status).toBe(0);
+      const lines = result.stdout.replace(/\n$/, "").split("\n");
+
+      // A title row, then one row per profile.
+      expect(lines[0]).toMatch(/^ID\s+BROWSER\s+HEADLESS\s+ALLOWED SITES$/);
+      expect(lines).toHaveLength(3);
+
+      // Every cell starts exactly under its title.
+      const browserColumn = lines[0]!.indexOf("BROWSER");
+      const headlessColumn = lines[0]!.indexOf("HEADLESS");
+      for (const row of [lines[1]!, lines[2]!]) {
+        expect(row.slice(browserColumn)).toMatch(/^chromium/);
+        expect(row.slice(headlessColumn)).toMatch(/^(true|false)/);
+      }
+
+      // The widest id sets the first column, with no ragged padding.
+      expect(lines[1]).toMatch(
+        /^docs-in-chromium\s+chromium\s+true\s+example\.com$/,
+      );
+      expect(lines[2]).toMatch(/^work-in-chromium\s+chromium\s+false\s+-$/);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
     "prints 'no profiles' when there are none, and one line per profile (id, browser, headless) after adding",
     () => {
       const empty = runCli(["profile", "list"], home);
@@ -51,7 +93,8 @@ describe("anyb profile list", () => {
       const result = runCli(["profile", "list"], home);
       expect(result.status).toBe(0);
       const lines = result.stdout.trim().split("\n");
-      expect(lines).toHaveLength(2);
+      // A title row, then one row per profile.
+      expect(lines).toHaveLength(3);
       expect(
         lines.some(
           (l) =>

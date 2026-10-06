@@ -190,6 +190,27 @@ function runProfileAddCommand(args: string[]): number {
   return 0;
 }
 
+const PROFILE_COLUMNS = ["ID", "BROWSER", "HEADLESS", "ALLOWED SITES"];
+
+/**
+ * Lays out a title row and `rows` as space-padded columns, each column as
+ * wide as its widest cell. The last column is never padded, so a long
+ * allowed-sites list does not leave trailing spaces.
+ */
+function formatTable(titles: string[], rows: string[][]): string[] {
+  const widths = titles.map((title, column) =>
+    Math.max(title.length, ...rows.map((row) => (row[column] ?? "").length)),
+  );
+  const layOut = (cells: string[]): string =>
+    cells
+      .map((cell, column) =>
+        column === cells.length - 1 ? cell : cell.padEnd(widths[column] ?? 0),
+      )
+      .join("  ")
+      .trimEnd();
+  return [layOut(titles), ...rows.map(layOut)];
+}
+
 function runProfileListCommand(): number {
   const paths = resolvePaths();
   const profiles = listProfiles(paths);
@@ -198,19 +219,26 @@ function runProfileListCommand(): number {
     console.log("no profiles");
     return 0;
   }
-  const lines = [
-    ...profiles.map((profile) => {
-      const allowed = profile.allowedOrigins
-        ? `  allowed=${profile.allowedOrigins.join(",")}`
-        : "";
-      return {
-        id: profile.id,
-        line: `${profile.id}  ${profile.browser}  headless=${profile.headless}${allowed}`,
-      };
-    }),
-    ...broken.map(({ id, problem }) => ({ id, line: `${id}  ${problem}` })),
+  const rows = [
+    ...profiles.map((profile) => ({
+      id: profile.id,
+      cells: [
+        profile.id,
+        profile.browser,
+        String(profile.headless),
+        profile.allowedOrigins ? profile.allowedOrigins.join(",") : "-",
+      ],
+    })),
+    ...broken.map(({ id, problem }) => ({
+      id,
+      cells: [id, "-", "-", problem],
+    })),
   ].sort((a, b) => (a.id < b.id ? -1 : 1));
-  for (const { line } of lines) {
+
+  for (const line of formatTable(
+    PROFILE_COLUMNS,
+    rows.map((r) => r.cells),
+  )) {
     console.log(line);
   }
   return 0;
