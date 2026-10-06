@@ -25,6 +25,14 @@ commands:
   daemon     run the daemon in the foreground (internal; use 'mcp' instead)
   status     print daemon status without starting it
   stop       stop the daemon if it is running
+  profile    create and manage browser profiles (see below)
+
+profile subcommands:
+  add <name> <browser> [--headless] [--allow <list>]   create a profile
+  list                                                 show every profile
+  remove <id>                                          delete a profile
+  set <id> <key>=<value>                               change headless or allowedOrigins
+  login <id> <url>                                     open a window to sign in by hand
 
 options:
   -v, --version   print the version
@@ -306,6 +314,15 @@ async function runProfileLoginCommand(args: string[]): Promise<number> {
   }
 }
 
+const PROFILE_USAGE = `usage: anyb profile <subcommand>
+
+subcommands:
+  add <name> <browser> [--headless] [--allow <list>]   create a profile
+  list                                                 show every profile
+  remove <id>                                          delete a profile
+  set <id> <key>=<value>                               change headless or allowedOrigins
+  login <id> <url>                                     open a window to sign in by hand`;
+
 async function runProfileCommand(args: string[]): Promise<number> {
   const [subcommand, ...rest] = args;
   if (subcommand === "add") {
@@ -323,7 +340,10 @@ async function runProfileCommand(args: string[]): Promise<number> {
   if (subcommand === "login") {
     return runProfileLoginCommand(rest);
   }
-  console.error(`anyb: unknown 'profile' subcommand '${String(subcommand)}'`);
+  if (subcommand !== undefined) {
+    console.error(`anyb: unknown 'profile' subcommand '${subcommand}'`);
+  }
+  console.error(PROFILE_USAGE);
   return 2;
 }
 
