@@ -11,6 +11,7 @@ import {
   BrowserDetectionUnsupportedError,
   findBrowserExecutable,
 } from "./browserDetect.js";
+import { parseAllowedOrigin } from "./allowedSites.js";
 import type { AnybrowserPaths } from "./paths.js";
 
 /** Chromium-family browsers supported in this slice. Firefox and WebKit are not yet. */
@@ -39,6 +40,8 @@ export interface Profile {
   headless: boolean;
   /** Absolute path to the installed browser executable, or null for `chromium` (Playwright's bundled build). */
   executablePath: string | null;
+  /** Origin patterns the profile may reach, or null for no restriction (the default). */
+  allowedOrigins: string[] | null;
   createdAt: string;
 }
 
@@ -58,6 +61,25 @@ export function validateName(name: string): string | null {
     return "profile name must be a lowercase slug: [a-z0-9]+(-[a-z0-9]+)*";
   }
   return null;
+}
+
+/**
+ * Validates and normalizes a whole allowed-sites list (see
+ * `parseAllowedOrigin` for the entry forms): entries trimmed, hosts
+ * lowercased and in ASCII form. Returns the first error message otherwise.
+ */
+export function normalizeAllowedOrigins(
+  entries: string[],
+): { ok: true; value: string[] } | { ok: false; message: string } {
+  const value: string[] = [];
+  for (const entry of entries) {
+    const parsed = parseAllowedOrigin(entry);
+    if (!parsed.ok) {
+      return { ok: false, message: parsed.error };
+    }
+    value.push(parsed.normalized);
+  }
+  return { ok: true, value };
 }
 
 /** Validates a `browser`. Returns an error message, or null when it is one of the supported browsers. */
@@ -80,7 +102,7 @@ function profileDir(paths: AnybrowserPaths, id: string): string {
   return join(paths.home, "profiles", id);
 }
 
-function profileJsonPath(paths: AnybrowserPaths, id: string): string {
+export function profileJsonPath(paths: AnybrowserPaths, id: string): string {
   return join(profileDir(paths, id), "profile.json");
 }
 
@@ -88,22 +110,65 @@ export function profileExists(paths: AnybrowserPaths, id: string): boolean {
   return existsSync(profileJsonPath(paths, id));
 }
 
+/** What `profile_status`, `profile_list` and `anyb profile list` say about a profile whose `allowedOrigins` was hand-edited into something that is not a list of strings. */
+export const UNREADABLE_ALLOWED_ORIGINS =
+  "allowedOrigins in profile.json is unreadable: it must be null or a list of strings";
+
+function hasValidAllowedOrigins(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (Array.isArray(value) && value.every((entry) => typeof entry === "string"))
+  );
+}
+
+function readRaw(
+  paths: AnybrowserPaths,
+  id: string,
+): (Omit<Profile, "allowedOrigins"> & { allowedOrigins?: unknown }) | null {
+  try {
+    return JSON.parse(readFileSync(profileJsonPath(paths, id), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads profile.json, or null when it is missing, not JSON, or its
+ * `allowedOrigins` is neither null nor a list of strings (a hand-edit gone
+ * wrong): a list that cannot be read is never guessed at.
+ */
 export function readProfile(
   paths: AnybrowserPaths,
   id: string,
 ): Profile | null {
-  try {
-    const raw = readFileSync(profileJsonPath(paths, id), "utf8");
-    return JSON.parse(raw) as Profile;
-  } catch {
+  const parsed = readRaw(paths, id);
+  if (!parsed || !hasValidAllowedOrigins(parsed.allowedOrigins)) {
     return null;
   }
+  // Older profile.json files predate the field: no list means unrestricted.
+  return {
+    ...parsed,
+    allowedOrigins: (parsed.allowedOrigins as string[] | null) ?? null,
+  };
+}
+
+/** The reason profile.json is unreadable because of its allowed-sites list, or null when it is fine (or unreadable for another reason). */
+export function allowedOriginsProblem(
+  paths: AnybrowserPaths,
+  id: string,
+): string | null {
+  const parsed = readRaw(paths, id);
+  return parsed && !hasValidAllowedOrigins(parsed.allowedOrigins)
+    ? UNREADABLE_ALLOWED_ORIGINS
+    : null;
 }
 
 export interface CreateProfileInput {
   name: string;
   browser: SupportedBrowser;
   headless?: boolean;
+  allowedOrigins?: string[] | null;
   executablePath: string | null;
 }
 
@@ -123,6 +188,7 @@ export function createProfile(
     browser: input.browser,
     headless: input.headless ?? false,
     executablePath: input.executablePath,
+    allowedOrigins: input.allowedOrigins ?? null,
     createdAt: new Date().toISOString(),
   };
   writeFileSync(profileJsonPath(paths, id), JSON.stringify(profile, null, 2));
@@ -133,6 +199,7 @@ export interface AddProfileRequest {
   name: string;
   browser: string;
   headless?: boolean;
+  allowedOrigins?: string[] | null;
 }
 
 export type AddProfileOutcome =
@@ -143,6 +210,7 @@ export type AddProfileOutcome =
       kind:
         | "invalid-name"
         | "invalid-browser"
+        | "invalid-allowed-origins"
         | "detection-unsupported"
         | "not-found"
         | "exists";
@@ -169,6 +237,14 @@ export function addProfileWithDetection(
     return { ok: false, kind: "invalid-browser", message: browserError };
   }
   const browser = input.browser as SupportedBrowser;
+  const allowed = normalizeAllowedOrigins(input.allowedOrigins ?? []);
+  if (!allowed.ok) {
+    return {
+      ok: false,
+      kind: "invalid-allowed-origins",
+      message: allowed.message,
+    };
+  }
 
   let executablePath: string | null = null;
   if (browser !== "chromium") {
@@ -198,6 +274,7 @@ export function addProfileWithDetection(
       name: input.name,
       browser,
       headless: input.headless ?? false,
+      allowedOrigins: input.allowedOrigins ? allowed.value : null,
       executablePath,
     });
     return { ok: true, id: profile.id };
@@ -218,9 +295,9 @@ export function removeProfile(paths: AnybrowserPaths, id: string): void {
   rmSync(profileDir(paths, id), { recursive: true, force: true });
 }
 
-const SETTABLE_KEYS = new Set(["headless"]);
+const SETTABLE_KEYS = new Set(["headless", "allowedOrigins"]);
 
-/** Updates one setting in profile.json (currently only `headless`). Throws on an unknown key/profile/value. */
+/** Updates one setting in profile.json (`headless` or `allowedOrigins`). Throws on an unknown key/profile/value. */
 export function setProfileSetting(
   paths: AnybrowserPaths,
   id: string,
@@ -234,10 +311,24 @@ export function setProfileSetting(
   if (!profile) {
     throw new Error(`profile '${id}' does not exist`);
   }
-  if (value !== "true" && value !== "false") {
-    throw new Error(`'${key}' must be 'true' or 'false'`);
+  let updated: Profile;
+  if (key === "allowedOrigins") {
+    // An empty value or 'off' clears the list back to unrestricted.
+    let entries: string[] | null = null;
+    if (value !== "" && value !== "off") {
+      const normalized = normalizeAllowedOrigins(value.split(","));
+      if (!normalized.ok) {
+        throw new Error(normalized.message);
+      }
+      entries = normalized.value;
+    }
+    updated = { ...profile, allowedOrigins: entries };
+  } else {
+    if (value !== "true" && value !== "false") {
+      throw new Error(`'${key}' must be 'true' or 'false'`);
+    }
+    updated = { ...profile, headless: value === "true" };
   }
-  const updated: Profile = { ...profile, headless: value === "true" };
   writeFileSync(profileJsonPath(paths, id), JSON.stringify(updated, null, 2));
 }
 
@@ -260,4 +351,27 @@ export function listProfiles(paths: AnybrowserPaths): StoredProfile[] {
     }
   }
   return profiles;
+}
+
+/** Profiles whose profile.json exists but whose allowed-sites list is unreadable (so `listProfiles` skips them), sorted by id. */
+export function listProfilesWithBadList(
+  paths: AnybrowserPaths,
+): Array<{ id: string; problem: string }> {
+  const root = join(paths.home, "profiles");
+  let ids: string[];
+  try {
+    ids = readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+  const broken: Array<{ id: string; problem: string }> = [];
+  for (const id of ids.sort()) {
+    const problem = allowedOriginsProblem(paths, id);
+    if (problem) {
+      broken.push({ id, problem });
+    }
+  }
+  return broken;
 }

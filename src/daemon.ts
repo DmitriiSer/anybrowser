@@ -23,10 +23,13 @@ import {
   BrowserContextRouter,
   BrowserSession,
   ProfileHeadlessRunningError,
+  ProfileUrlBlockedError,
 } from "./browser.js";
 import {
   addProfileWithDetection,
+  allowedOriginsProblem,
   listProfiles,
+  listProfilesWithBadList,
   profileExists,
   readProfile,
 } from "./profile.js";
@@ -46,7 +49,7 @@ const DAEMON_STATUS_TOOL: Tool = {
 const PROFILE_LIST_TOOL: Tool = {
   name: "profile_list",
   description:
-    "List every anybrowser profile: id, browser, headless, and whether it is currently running.",
+    "List every anybrowser profile: id, browser, headless, allowedOrigins (the sites the profile is restricted to, or null for no restriction), and whether it is currently running.",
   inputSchema: {
     type: "object",
     properties: {},
@@ -83,7 +86,7 @@ const PROFILE_CREATE_TOOL: Tool = {
 const PROFILE_STATUS_TOOL: Tool = {
   name: "profile_status",
   description:
-    "Report a profile's running state, tab count (when running), headless flag, and browser.",
+    "Report a profile's running state, tab count (when running), headless flag, browser, and allowedOrigins (the sites the profile is restricted to, or null for no restriction).",
   inputSchema: {
     type: "object",
     properties: {
@@ -264,10 +267,19 @@ function startMcpSession(
           id: profile.id,
           browser: profile.browser,
           headless: profile.headless,
+          allowedOrigins: profile.allowedOrigins,
           running: state.browserRouter.runningProfileIds().includes(profile.id),
         }));
+        const broken = listProfilesWithBadList(state.paths).map(
+          ({ id, problem }) => ({ id, error: problem }),
+        );
         return {
-          content: [{ type: "text", text: JSON.stringify(profiles) }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify([...profiles, ...broken]),
+            },
+          ],
         };
       }
       if (request.params.name === "profile_create") {
@@ -275,7 +287,22 @@ function startMcpSession(
           name?: unknown;
           browser?: unknown;
           headless?: unknown;
+          allowedOrigins?: unknown;
         };
+        if (args.allowedOrigins !== undefined) {
+          // The allowed-sites list is a human guard rail, like `headless`
+          // (decision 7). Failing loudly beats ignoring it: an agent that
+          // thought it had pinned a profile would act as if it were safe.
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "profile_create cannot set an allowed-sites list; only the user can, with 'anyb profile add <name> <browser> --allow <list>' or 'anyb profile set <id> allowedOrigins=<list>'",
+              },
+            ],
+          };
+        }
         if (typeof args.name !== "string" || typeof args.browser !== "string") {
           return {
             isError: true,
@@ -314,6 +341,18 @@ function startMcpSession(
             `unknown profile '${args.profile}'`,
           );
         }
+        const problem = allowedOriginsProblem(state.paths, args.profile);
+        if (problem) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Profile '${args.profile}': ${problem}. The last list read stays in force while the daemon runs. Ask the user to fix profile.json outside the agent.`,
+              },
+            ],
+          };
+        }
         const stored = readProfile(state.paths, args.profile)!;
         const runningContext = state.browserRouter.runningContext(args.profile);
         const idleForMs = state.browserRouter.idleForMs(args.profile);
@@ -321,6 +360,7 @@ function startMcpSession(
           running: runningContext !== undefined,
           headless: stored.headless,
           browser: stored.browser,
+          allowedOrigins: stored.allowedOrigins,
           ...(runningContext
             ? {
                 tabCount: runningContext.pages().length,
@@ -355,7 +395,10 @@ function startMcpSession(
         try {
           await state.browserRouter.loginLaunch(args.profile, args.url);
         } catch (error) {
-          if (error instanceof ProfileHeadlessRunningError) {
+          if (
+            error instanceof ProfileHeadlessRunningError ||
+            error instanceof ProfileUrlBlockedError
+          ) {
             return {
               isError: true,
               content: [{ type: "text", text: error.message }],
@@ -499,6 +542,10 @@ async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
 
 /** Runs the daemon in the foreground. Resolves once it is listening; keeps running until shutdown. */
 export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
+  // Playwright's own switch for NOT forcing loopback through a browser's proxy.
+  // The allowed-sites proxy must see local servers too, and the check upstream
+  // is plain truthiness (even "0" disables forcing), so only deleting it is safe.
+  delete process.env["PLAYWRIGHT_DISABLE_FORCED_CHROMIUM_PROXIED_LOOPBACK"];
   assertSocketPathFits(paths.socket);
   log(`start pid=${process.pid} version=${readVersion()}`);
 

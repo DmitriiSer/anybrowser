@@ -1,13 +1,28 @@
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
 import { createConnection } from "@playwright/mcp";
-import { chromium, type BrowserContext } from "playwright";
+import {
+  chromium,
+  type BrowserContext,
+  type Frame,
+  type Page,
+  type Request,
+  type Response,
+} from "playwright";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { AnybrowserPaths } from "./paths.js";
-import { profileExists, readProfile } from "./profile.js";
+import { isUrlAllowed } from "./allowedSites.js";
+import { BlockLedger, type BlockAttribution } from "./blockLedger.js";
+import {
+  allowedOriginsProblem,
+  profileExists,
+  profileJsonPath,
+  readProfile,
+} from "./profile.js";
+import { SiteProxy } from "./siteProxy.js";
 
 /**
  * A reserved key used only to fetch the upstream tool schema (never a real
@@ -105,6 +120,62 @@ function absolutizeSnapshotLinks(content: unknown[]): unknown[] {
   });
 }
 
+/** How long a refused navigation is given to land on Chromium's error page before the caller moves on. */
+const BLOCKED_NAVIGATION_SETTLE_MS = 2000;
+
+/** How long a tool call waits for Playwright's events to say which request the proxy just refused. */
+const CLAIM_WAIT_MS = 1000;
+
+/** The longest a cached allowed-sites list is trusted without re-reading profile.json. */
+const ALLOWED_CACHE_MAX_AGE_MS = 1000;
+
+/** The message for an agent whose request was refused. It never says how to change the list. */
+function blockedMessage(
+  profile: string,
+  allowedOrigins: string[],
+  url: string,
+): string {
+  return (
+    `Blocked: ${url} is not allowed. ` +
+    `Profile '${profile}' is restricted to an allowed-sites list (${allowedOrigins.join(", ")}). ` +
+    `The user sets that list outside the agent; do not try to change it or get around it. ` +
+    `If this site is needed, tell the user.`
+  );
+}
+
+/** `url` without its query and fragment, for the log: those are where tokens live. */
+function loggableUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin === "null" ? parsed.protocol : parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "(unparseable)";
+  }
+}
+
+/** Whether `page` was opened, directly or through other pages, by `ancestor` (a popup of it). */
+async function openedBy(page: Page, ancestor: Page): Promise<boolean> {
+  let current: Page = page;
+  for (let depth = 0; depth < 5; depth++) {
+    const opener = await current.opener().catch(() => null);
+    if (opener === null) {
+      return false;
+    }
+    if (opener === ancestor) {
+      return true;
+    }
+    current = opener;
+  }
+  return false;
+}
+
+/** Up to five distinct URLs, then a count of the rest, for one message. */
+function describeUrls(blocks: BlockAttribution[]): string {
+  const urls = [...new Set(blocks.map((b) => b.url))];
+  const shown = urls.slice(0, 5).join(", ");
+  return urls.length > 5 ? `${shown} and ${urls.length - 5} more` : shown;
+}
+
 /**
  * Owns the one persistent Chromium context per profile, launched lazily on
  * the first browser tool CALL (never on daemon start, never on a bare
@@ -113,6 +184,9 @@ function absolutizeSnapshotLinks(content: unknown[]): unknown[] {
  */
 /** Thrown by `BrowserContextRouter.loginLaunch` when a profile is already running headless without the global override. */
 export class ProfileHeadlessRunningError extends Error {}
+
+/** Thrown by `BrowserContextRouter.loginLaunch` when the allowed-sites list refuses the URL; the message is safe to show the agent. */
+export class ProfileUrlBlockedError extends Error {}
 
 /** Per-context close timeout shared by `closeAll` and a single profile's idle-close. */
 const PER_CONTEXT_CLOSE_TIMEOUT_MS = 3000;
@@ -143,6 +217,26 @@ export class BrowserContextRouter {
    * now-closed context.
    */
   private readonly generations = new Map<string, number>();
+  /** The last allowed-sites list read for each profile, used if profile.json is unreadable mid-edit. */
+  private readonly lastKnownAllowed = new Map<string, string[] | null>();
+  /** The profile.json stamp and result of the last list read, so a request does not re-parse the file. */
+  private readonly allowedCache = new Map<
+    string,
+    { stamp: string; list: string[] | null; at: number }
+  >();
+  /** The running profile's proxy listener (see src/siteProxy.ts). Every profile has one, pinned or not. */
+  private readonly proxies = new Map<string, SiteProxy>();
+  /**
+   * Every listener port ever opened, kept for the daemon's life: a proxy
+   * never dials another proxy, whichever profile it belongs to.
+   */
+  private readonly proxyPorts = new Set<number>();
+  /** Listeners whose browser may still be alive (its close failed or timed out), kept so the port is never reused under it. */
+  private readonly retiredProxies: SiteProxy[] = [];
+  /** What each profile's proxy refused, claimed by Playwright events (see src/blockLedger.ts). */
+  private readonly ledgers = new Map<string, BlockLedger>();
+  /** When each frame last committed a navigation, so a refused navigation can tell it has been replaced. */
+  private readonly commitTimes = new WeakMap<Frame, number>();
 
   constructor(
     readonly paths: AnybrowserPaths,
@@ -237,7 +331,38 @@ export class BrowserContextRouter {
     this.runningContexts.delete(profile);
     this.runningHeadless.delete(profile);
     this.bumpGeneration(profile);
-    await this.closeOneContext(profile, context, PER_CONTEXT_CLOSE_TIMEOUT_MS);
+    const proxy = this.proxies.get(profile);
+    this.proxies.delete(profile);
+    const closed = await this.closeOneContext(
+      profile,
+      context,
+      PER_CONTEXT_CLOSE_TIMEOUT_MS,
+    );
+    await this.releaseProxy(profile, proxy, closed);
+  }
+
+  /**
+   * Closes a profile's listener, but only once its browser is known to be
+   * gone: a port released while a browser launched against it may still live
+   * could be bound by a different listener later, and the live browser would
+   * use that one with no relaunch. An uncertain close keeps the listener.
+   */
+  private async releaseProxy(
+    profile: string,
+    proxy: SiteProxy | undefined,
+    browserClosed: boolean,
+  ): Promise<void> {
+    if (!proxy) {
+      return;
+    }
+    if (browserClosed) {
+      await proxy.close();
+    } else {
+      this.retiredProxies.push(proxy);
+      this.log(
+        `proxy kept: profile=${profile} port=${proxy.port} reason=browser close not confirmed`,
+      );
+    }
   }
 
   /**
@@ -252,8 +377,9 @@ export class BrowserContextRouter {
     profile: string,
     context: BrowserContext,
     timeoutMs: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let timedOut = false;
+    let closed = false;
     const closePromise = context.close();
     const timer = new Promise<void>((resolve) => {
       setTimeout(() => {
@@ -266,6 +392,7 @@ export class BrowserContextRouter {
       if (timedOut) {
         this.log(`browser close timed out: profile=${profile}`);
       } else {
+        closed = true;
         this.log(`browser close: profile=${profile}`);
       }
     } catch (error) {
@@ -277,6 +404,7 @@ export class BrowserContextRouter {
       // catch so a late rejection never surfaces as an unhandled rejection.
       closePromise.catch(() => {});
     }
+    return closed;
   }
 
   /**
@@ -311,6 +439,204 @@ export class BrowserContextRouter {
       this.contexts.set(profile, launching);
     }
     return launching;
+  }
+
+  private ledgerFor(profile: string): BlockLedger {
+    let ledger = this.ledgers.get(profile);
+    if (!ledger) {
+      ledger = new BlockLedger();
+      this.ledgers.set(profile, ledger);
+    }
+    return ledger;
+  }
+
+  /** A cursor for `blocksSince`: everything refused for `profile` after this call is "new". */
+  blockMark(profile: string): number {
+    return this.ledgerFor(profile).mark();
+  }
+
+  /**
+   * What `profile`'s proxy refused after `mark` and a Playwright event has
+   * attributed to a URL and a page, one per refusal (a caller dedupes by URL for display). Waits a moment for
+   * events that trail the refusal; a refusal no event ever claims (a blocked
+   * WebSocket, say) is in the log but cannot be attributed, so it is left out.
+   */
+  async blocksSince(
+    profile: string,
+    mark: number,
+  ): Promise<BlockAttribution[]> {
+    const ledger = this.ledgerFor(profile);
+    await ledger.whenClaimed(mark, CLAIM_WAIT_MS);
+    const blocks: BlockAttribution[] = [];
+    for (const entry of ledger.since(mark)) {
+      if (entry.claim) {
+        blocks.push(entry.claim);
+      }
+    }
+    return blocks;
+  }
+
+  /**
+   * The profile's allowed-sites list as stored right now (null or empty: no
+   * restriction). Every request the browser makes asks, so the answer is
+   * cached against profile.json's modification stamp (and re-read at least
+   * once a second): an edit still takes effect on the next request. While
+   * profile.json is unreadable (a write in progress), the last list read
+   * stays in force rather than the profile briefly becoming open.
+   */
+  currentAllowedOrigins(profile: string): string[] | null {
+    let stamp = "";
+    try {
+      const stat = statSync(profileJsonPath(this.paths, profile));
+      stamp = `${stat.mtimeMs}:${stat.size}`;
+    } catch {
+      // Unreadable below as well; the last good list stays.
+    }
+    const now = Date.now();
+    const cached = this.allowedCache.get(profile);
+    if (
+      cached &&
+      stamp !== "" &&
+      cached.stamp === stamp &&
+      now - cached.at < ALLOWED_CACHE_MAX_AGE_MS
+    ) {
+      return cached.list;
+    }
+    const stored = readProfile(this.paths, profile);
+    if (stored) {
+      this.lastKnownAllowed.set(profile, stored.allowedOrigins);
+      this.allowedCache.set(profile, {
+        stamp,
+        list: stored.allowedOrigins,
+        at: now,
+      });
+      return stored.allowedOrigins;
+    }
+    return this.lastKnownAllowed.get(profile) ?? null;
+  }
+
+  /**
+   * A refusal message for a `browser_navigate` URL whose scheme never crosses
+   * the proxy (`file:`, `javascript:`, ...), or null when the proxy is the
+   * right judge of it. Only a pinned profile refuses; `http` and `https` are
+   * always left to the proxy.
+   */
+  refuseNonNetworkUrl(profile: string, url: string): string | null {
+    const list = this.currentAllowedOrigins(profile);
+    if (!list?.length) {
+      return null;
+    }
+    let protocol: string;
+    try {
+      protocol = new URL(url).protocol;
+    } catch {
+      return null; // The browser decides what an unparseable URL means.
+    }
+    if (protocol === "http:" || protocol === "https:") {
+      return null;
+    }
+    if (isUrlAllowed(url, list)) {
+      return null;
+    }
+    this.log(`blocked: profile=${profile} url=${loggableUrl(url)}`);
+    return blockedMessage(profile, list, url);
+  }
+
+  /** Context-level events: they see popups and service-worker requests that no page event does. */
+  private watchBlocks(profile: string, context: BrowserContext): void {
+    const ledger = this.ledgerFor(profile);
+    const attribute =
+      (request: Request) =>
+      (refusedAt: number): BlockAttribution => {
+        let frame: Frame | null = null;
+        let page: Page | null = null;
+        let navigation = false;
+        try {
+          frame = request.frame();
+          page = frame.page();
+          navigation =
+            request.isNavigationRequest() && frame.parentFrame() === null;
+        } catch {
+          // A request with no frame (e.g. a service worker's).
+        }
+        if (page === null) {
+          this.log(
+            `blocked request not attributed to a page: profile=${profile} url=${loggableUrl(request.url())}`,
+          );
+        }
+        return {
+          url: request.url(),
+          navigation,
+          page,
+          frame,
+          ...(navigation && frame
+            ? {
+                settled: this.whenReplaced(
+                  profile,
+                  frame,
+                  refusedAt,
+                  request.url(),
+                ),
+              }
+            : {}),
+        };
+      };
+    context.on("requestfailed", (request: Request) => {
+      ledger.claimConnect(request.url(), attribute(request));
+    });
+    context.on("response", (response: Response) => {
+      if (response.headers()["x-anybrowser-blocked"] === "1") {
+        ledger.claimHttp(response.url(), attribute(response.request()));
+      }
+    });
+    const track = (page: Page) => {
+      page.on("framenavigated", (frame) => {
+        this.commitTimes.set(frame, Date.now());
+      });
+    };
+    context.pages().forEach(track);
+    context.on("page", track);
+  }
+
+  /**
+   * After a top-level navigation is refused, the tab commits something in
+   * its place (Chromium's own error page, or our block page) a moment later,
+   * and a navigation issued before that lands fails with "interrupted by
+   * another navigation". Resolves when THIS frame has committed after the
+   * refusal (so one already showing from an earlier block cannot satisfy it),
+   * when the page goes away, or after a deadline, which it logs.
+   */
+  private whenReplaced(
+    profile: string,
+    frame: Frame,
+    refusedAt: number,
+    url: string,
+  ): Promise<void> {
+    if ((this.commitTimes.get(frame) ?? 0) >= refusedAt) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const page = frame.page();
+      const done = () => {
+        clearTimeout(timer);
+        page.off("framenavigated", onNavigated);
+        page.off("close", done);
+        resolve();
+      };
+      const onNavigated = (navigated: Frame) => {
+        if (navigated === frame) {
+          done();
+        }
+      };
+      const timer = setTimeout(() => {
+        this.log(
+          `blocked navigation did not settle: profile=${profile} url=${loggableUrl(url)} waited=${BLOCKED_NAVIGATION_SETTLE_MS}ms`,
+        );
+        done();
+      }, BLOCKED_NAVIGATION_SETTLE_MS);
+      page.on("framenavigated", onNavigated);
+      page.on("close", done);
+    });
   }
 
   /** Ids of profiles with a currently running (successfully launched) browser, sorted. */
@@ -351,7 +677,10 @@ export class BrowserContextRouter {
           Math.min(PER_CONTEXT_CLOSE_TIMEOUT_MS, overallDeadline - Date.now()),
         );
         this.bumpGeneration(profile);
-        await this.closeOneContext(profile, context, timeoutMs);
+        const proxy = this.proxies.get(profile);
+        this.proxies.delete(profile);
+        const closed = await this.closeOneContext(profile, context, timeoutMs);
+        await this.releaseProxy(profile, proxy, closed);
       }),
     );
 
@@ -383,10 +712,37 @@ export class BrowserContextRouter {
     } else {
       context = await this.getContext(profile, isHeadless());
     }
+    const allowedOrigins = this.currentAllowedOrigins(profile);
+    if (allowedOrigins?.length && !isUrlAllowed(url, allowedOrigins)) {
+      this.log(`blocked: profile=${profile} url=${loggableUrl(url)}`);
+      throw new ProfileUrlBlockedError(
+        blockedMessage(profile, allowedOrigins, url),
+      );
+    }
     this.beginActivity(profile);
     try {
+      const mark = this.blockMark(profile);
       const page = await context.newPage();
-      await page.goto(url);
+      let failure: unknown;
+      try {
+        await page.goto(url);
+      } catch (error) {
+        failure = error;
+      }
+      // The proxy's refusal decides whether this was a block; what the page
+      // went through (a redirect off the list, a refused tunnel) decides nothing.
+      const blocked = (await this.blocksSince(profile, mark)).find(
+        (b) => b.navigation && b.page === page,
+      );
+      if (blocked && allowedOrigins?.length) {
+        await page.close().catch(() => {});
+        throw new ProfileUrlBlockedError(
+          blockedMessage(profile, allowedOrigins, blocked.url),
+        );
+      }
+      if (failure !== undefined) {
+        throw failure;
+      }
       await page.bringToFront();
     } finally {
       this.endActivity(profile);
@@ -399,6 +755,10 @@ export class BrowserContextRouter {
   ): Promise<BrowserContext> {
     const stored = readProfile(this.paths, profile);
     if (!stored) {
+      const problem = allowedOriginsProblem(this.paths, profile);
+      if (problem) {
+        throw new Error(`profile '${profile}': ${problem}`);
+      }
       // Should not normally happen: BrowserSession checks existence before
       // calling getContext. Guards against a profile removed mid-flight.
       throw new Error(`unknown profile '${profile}'`);
@@ -444,25 +804,63 @@ export class BrowserContextRouter {
     // `chromium` driver: for `chromium` itself with its bundled build (no
     // `executablePath`), for every other Chromium-family browser by pointing
     // that same driver at the installed executable.
-    return chromium.launchPersistentContext(userDataDir, {
-      headless,
-      // The daemon is the sole owner of browser lifetime (decision 5) and
-      // already installs its own SIGINT/SIGTERM handlers (daemon.ts) that
-      // close every context gracefully before exiting. Without these three
-      // flags, Playwright installs ITS OWN process-wide signal handlers that
-      // independently race to close the same browser process the instant a
-      // signal arrives - confirmed by a spike: on SIGTERM, Playwright's own
-      // handler and our explicit `context.close()` call both initiate a
-      // close of the same browser concurrently, and whichever tears down
-      // the browser process first can do so before the other's cookie
-      // flush lands, losing a cookie set moments earlier nondeterministically.
-      handleSIGINT: false,
-      handleSIGTERM: false,
-      handleSIGHUP: false,
-      ...(stored.executablePath
-        ? { executablePath: stored.executablePath }
-        : {}),
+    // The listener exists before the browser, for every profile (a pinned one
+    // enforces its list; an unpinned one passes everything through). The port
+    // is a launch flag, so a conditional listener would make turning a list on
+    // need a restart, and an edit must apply to a running session at once.
+    const proxy = await SiteProxy.start({
+      profile,
+      allowedOrigins: () => this.currentAllowedOrigins(profile),
+      isOwnPort: (port) => this.proxyPorts.has(port),
+      describeBlock: (url) =>
+        blockedMessage(profile, this.currentAllowedOrigins(profile) ?? [], url),
+      onRefusal: (refusal) => {
+        this.ledgerFor(profile).record(refusal);
+        this.log(`blocked: profile=${profile} url=${loggableUrl(refusal.url)}`);
+      },
+      log: this.log,
     });
+    this.proxyPorts.add(proxy.port);
+    this.proxies.set(profile, proxy);
+    // Test-only: trust exactly the certificate whose public key hashes to
+    // this value, so a test can serve HTTPS locally. It pins one key; it is
+    // not a switch that turns certificate checking off.
+    const trustedSpki = process.env["ANYBROWSER_TEST_TRUSTED_SPKI"];
+    let context: BrowserContext;
+    try {
+      context = await chromium.launchPersistentContext(userDataDir, {
+        headless,
+        // No `bypass`: any loopback host there would switch off Chromium's
+        // forced proxying of loopback, and local servers must be checked too.
+        proxy: { server: `http://127.0.0.1:${proxy.port}` },
+        ...(trustedSpki
+          ? { args: [`--ignore-certificate-errors-spki-list=${trustedSpki}`] }
+          : {}),
+        // The daemon is the sole owner of browser lifetime (decision 5) and
+        // already installs its own SIGINT/SIGTERM handlers (daemon.ts) that
+        // close every context gracefully before exiting. Without these three
+        // flags, Playwright installs ITS OWN process-wide signal handlers that
+        // independently race to close the same browser process the instant a
+        // signal arrives - confirmed by a spike: on SIGTERM, Playwright's own
+        // handler and our explicit `context.close()` call both initiate a
+        // close of the same browser concurrently, and whichever tears down
+        // the browser process first can do so before the other's cookie
+        // flush lands, losing a cookie set moments earlier nondeterministically.
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
+        ...(stored.executablePath
+          ? { executablePath: stored.executablePath }
+          : {}),
+      });
+    } catch (error) {
+      // The browser never came up, so nothing can be using the port.
+      this.proxies.delete(profile);
+      await proxy.close();
+      throw error;
+    }
+    this.watchBlocks(profile, context);
+    return context;
   }
 }
 
@@ -518,6 +916,23 @@ export class BrowserSession {
         `unknown profile '${profile}'`,
       );
     }
+    if (
+      name === "browser_navigate" &&
+      typeof upstreamArgs["url"] === "string"
+    ) {
+      // `file:` and its kin never cross the proxy, so the wrapper is the only
+      // place a pinned profile can refuse them.
+      const refusal = this.router.refuseNonNetworkUrl(
+        profile,
+        upstreamArgs["url"],
+      );
+      if (refusal !== null) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `### Error\n${refusal}` }],
+        };
+      }
+    }
     this.router.beginActivity(profile);
     try {
       const connection = await this.getConnection(profile);
@@ -534,15 +949,83 @@ export class BrowserSession {
         });
         connection.tabOpened = true;
       }
+      const mark = this.router.blockMark(profile);
       const result = await connection.client.callTool({
         name,
         arguments: upstreamArgs,
       });
       const typed = result as { content: unknown[]; isError?: boolean };
-      return { ...typed, content: absolutizeSnapshotLinks(typed.content) };
+      const content = absolutizeSnapshotLinks(typed.content);
+      const allowedOrigins = this.router.currentAllowedOrigins(profile);
+      const blocks = await this.router.blocksSince(profile, mark);
+      if (blocks.length === 0 || !allowedOrigins?.length) {
+        return { ...typed, content };
+      }
+      // Only a block on THIS session's own current page is this call's
+      // error. A block on another session's tab is not, and says nothing here.
+      const ownPage = await this.currentPage(profile, connection);
+      const own: BlockAttribution[] = [];
+      const notes: BlockAttribution[] = [];
+      for (const block of blocks) {
+        if (block.page !== null && block.page === ownPage) {
+          (block.navigation ? own : notes).push(block);
+        } else if (
+          block.page === null ||
+          (ownPage !== null && (await openedBy(block.page, ownPage)))
+        ) {
+          notes.push(block);
+        }
+      }
+      if (own.length === 0 && notes.length === 0) {
+        return { ...typed, content };
+      }
+      // The tab is mid-way to what replaces it; the caller's next navigation
+      // would race it (see BrowserContextRouter.whenReplaced).
+      await Promise.all(own.map((b) => b.settled));
+      const shown = describeUrls([...own, ...notes]);
+      const message = blockedMessage(profile, allowedOrigins, shown);
+      if (own.length > 0) {
+        return {
+          ...typed,
+          isError: true,
+          content: [{ type: "text", text: `### Error\n${message}` }],
+        };
+      }
+      return {
+        ...typed,
+        content: [
+          ...content,
+          { type: "text", text: `### Blocked\n${message}` },
+        ],
+      };
     } finally {
       this.router.endActivity(profile);
     }
+  }
+
+  /**
+   * The page this connection's current tab is. Upstream keeps that per
+   * connection and does not expose it, so it is read from the tab list
+   * (`- 1: (current) ...`), whose order is the context's own page order.
+   * Null when it cannot be told, which treats nothing as this call's own.
+   */
+  private async currentPage(
+    profile: string,
+    connection: UpstreamConnection,
+  ): Promise<Page | null> {
+    const context = this.router.runningContext(profile);
+    if (!context) {
+      return null;
+    }
+    const tabs = (await connection.client.callTool({
+      name: "browser_tabs",
+      arguments: { action: "list" },
+    })) as { content?: Array<{ type?: string; text?: string }> };
+    const text = (tabs.content ?? []).map((item) => item.text ?? "").join("\n");
+    const index = /^- (\d+): \(current\)/m.exec(text)?.[1];
+    return index === undefined
+      ? null
+      : (context.pages()[Number(index)] ?? null);
   }
 
   private async fetchUpstreamTools(): Promise<Tool[]> {

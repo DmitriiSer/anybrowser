@@ -9,6 +9,7 @@ import { resolvePaths } from "./paths.js";
 import {
   addProfileWithDetection,
   listProfiles,
+  listProfilesWithBadList,
   profileExists,
   removeProfile,
   setProfileSetting,
@@ -147,17 +148,33 @@ function runProfileAddCommand(args: string[]): number {
   const [name, browser, ...rest] = args;
   if (name === undefined || browser === undefined) {
     console.error(
-      "anyb: usage: anyb profile add <name> <browser> [--headless]",
+      [
+        "anyb: usage: anyb profile add <name> <browser> [--headless] [--allow <list>]",
+        "  --allow <list>  comma-separated sites the profile may reach, e.g. example.com,*.example.com",
+        "                  example.com covers only that host on the default port (add :8080 or :* for",
+        "                  other ports); *.example.com covers its subdomains but not example.com itself;",
+        "                  list both to allow both. Anything else is blocked. Without --allow there is no limit.",
+      ].join("\n"),
     );
     return 2;
   }
   const headless = rest.includes("--headless");
+  const allowIndex = rest.indexOf("--allow");
+  const allowedOrigins =
+    allowIndex === -1 ? null : (rest[allowIndex + 1] ?? "").split(",");
 
   const paths = resolvePaths();
-  const outcome = addProfileWithDetection(paths, { name, browser, headless });
+  const outcome = addProfileWithDetection(paths, {
+    name,
+    browser,
+    headless,
+    allowedOrigins,
+  });
   if (!outcome.ok) {
     console.error(`anyb: ${outcome.message}`);
-    return outcome.kind === "invalid-name" || outcome.kind === "invalid-browser"
+    return outcome.kind === "invalid-name" ||
+      outcome.kind === "invalid-browser" ||
+      outcome.kind === "invalid-allowed-origins"
       ? 2
       : 1;
   }
@@ -168,14 +185,25 @@ function runProfileAddCommand(args: string[]): number {
 function runProfileListCommand(): number {
   const paths = resolvePaths();
   const profiles = listProfiles(paths);
-  if (profiles.length === 0) {
+  const broken = listProfilesWithBadList(paths);
+  if (profiles.length === 0 && broken.length === 0) {
     console.log("no profiles");
     return 0;
   }
-  for (const profile of profiles) {
-    console.log(
-      `${profile.id}  ${profile.browser}  headless=${profile.headless}`,
-    );
+  const lines = [
+    ...profiles.map((profile) => {
+      const allowed = profile.allowedOrigins
+        ? `  allowed=${profile.allowedOrigins.join(",")}`
+        : "";
+      return {
+        id: profile.id,
+        line: `${profile.id}  ${profile.browser}  headless=${profile.headless}${allowed}`,
+      };
+    }),
+    ...broken.map(({ id, problem }) => ({ id, line: `${id}  ${problem}` })),
+  ].sort((a, b) => (a.id < b.id ? -1 : 1));
+  for (const { line } of lines) {
+    console.log(line);
   }
   return 0;
 }
