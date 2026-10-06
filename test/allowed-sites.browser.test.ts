@@ -955,6 +955,121 @@ describe("consecutive blocks", () => {
   );
 });
 
+describe("the tab after a refused navigation", () => {
+  it(
+    "is left on about:blank, not on Chromium's error page that would retry the refused URL",
+    async () => {
+      const other = await site("localhost", "Other page");
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+
+      const { client, close } = await connectClient(home);
+      try {
+        const blocked = await client.callTool({
+          name: "browser_navigate",
+          arguments: { profile: "pinned-in-chromium", url: other.url },
+        });
+        // The agent still gets the refusal naming the URL.
+        expect(blocked.isError).toBe(true);
+        expect(textOf(blocked as never)).toContain(other.url);
+        expect(textOf(blocked as never)).toContain("Blocked:");
+
+        const tabs = await client.callTool({
+          name: "browser_tabs",
+          arguments: { profile: "pinned-in-chromium", action: "list" },
+        });
+        const listing = textOf(tabs as never);
+        const current = listing
+          .split("\n")
+          .find((l) => l.includes("(current)"));
+        expect(current, listing).toContain("about:blank");
+        expect(listing).not.toContain(other.url);
+        expect(listing).not.toContain("chrome-error://");
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("the tab after a refused tunnel", () => {
+  it(
+    "is not left on Chromium's error page either",
+    async () => {
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+
+      const { client, close } = await connectClient(home);
+      try {
+        const blocked = await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "pinned-in-chromium",
+            url: "https://localhost:8443/x",
+          },
+        });
+        expect(blocked.isError).toBe(true);
+        const tabs = await client.callTool({
+          name: "browser_tabs",
+          arguments: { profile: "pinned-in-chromium", action: "list" },
+        });
+        const listing = textOf(tabs as never);
+        expect(listing).not.toContain("chrome-error://");
+        expect(listing).not.toContain("localhost:8443");
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "shows the person watching the window what was refused",
+    async () => {
+      const other = await site("localhost", "Other page");
+      expect(
+        runCli(
+          ["profile", "add", "pinned", "chromium", "--allow", "127.0.0.1:*"],
+          home,
+        ).status,
+      ).toBe(0);
+
+      const { client, close } = await connectClient(home);
+      try {
+        for (const url of [other.url, "https://localhost:8443/x"]) {
+          const blocked = await client.callTool({
+            name: "browser_navigate",
+            arguments: { profile: "pinned-in-chromium", url },
+          });
+          expect(blocked.isError).toBe(true);
+          // What the window shows is what a snapshot of the tab reads.
+          const shown = await client.callTool({
+            name: "browser_evaluate",
+            arguments: {
+              profile: "pinned-in-chromium",
+              function: "() => document.body.innerText",
+            },
+          });
+          expect(textOf(shown as never), url).toContain("allowed-sites list");
+          expect(textOf(shown as never), url).toContain(url.split("/x")[0]);
+        }
+      } finally {
+        await close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
 describe("consecutive refused tunnels", () => {
   it(
     "leave the profile usable too: a refused CONNECT lands on Chromium's error page, and the next navigation must not be interrupted by it",

@@ -96,7 +96,7 @@ function withoutHopByHop(headers: IncomingHttpHeaders): IncomingHttpHeaders {
   return kept;
 }
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   return text.replace(
     /[&<>"']/g,
     (c) =>

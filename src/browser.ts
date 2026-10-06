@@ -22,7 +22,7 @@ import {
   profileJsonPath,
   readProfile,
 } from "./profile.js";
-import { SiteProxy } from "./siteProxy.js";
+import { escapeHtml, SiteProxy } from "./siteProxy.js";
 
 /**
  * A reserved key used only to fetch the upstream tool schema (never a real
@@ -675,6 +675,31 @@ export class BrowserContextRouter {
     });
   }
 
+  /**
+   * Moves a tab that a refused navigation left on an error page to
+   * about:blank (which cannot retry), and writes `message` into it so the
+   * person watching the window can see what was refused.
+   */
+  async parkRefusedTab(
+    profile: string,
+    page: Page | null,
+    message: string,
+  ): Promise<void> {
+    if (page === null || page.isClosed()) {
+      return;
+    }
+    try {
+      await page.goto("about:blank");
+      await page.setContent(
+        `<!doctype html><meta charset="utf-8"><title>Blocked</title><p>${escapeHtml(message)}</p>`,
+      );
+    } catch (error) {
+      this.log(
+        `could not park refused tab: profile=${profile} ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
   /** Ids of profiles with a currently running (successfully launched) browser, sorted. */
   runningProfileIds(): string[] {
     return [...this.runningContexts.keys()].sort();
@@ -1033,7 +1058,14 @@ export class BrowserSession {
       // would race it (see BrowserContextRouter.whenReplaced).
       await Promise.all(own.map((b) => b.settled));
       if (own.length > 0) {
+        // Chromium's error page retries the refused URL on its own, forever;
+        // leave the tab somewhere that cannot.
         const shown = describeUrls([...own, ...notes]);
+        await this.router.parkRefusedTab(
+          profile,
+          ownPage,
+          blockedMessage(profile, allowedOrigins, shown),
+        );
         return {
           ...typed,
           isError: true,
