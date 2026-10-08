@@ -271,6 +271,8 @@ export class BrowserContextRouter {
   private readonly retiredProxies: SiteProxy[] = [];
   /** What each profile's proxy refused, claimed by Playwright events (see src/blockLedger.ts). */
   private readonly ledgers = new Map<string, BlockLedger>();
+  /** Each running profile's first page, which no session owns and none may close. */
+  private readonly firstPages = new Map<string, Page>();
   /** When each frame last committed a navigation, so a refused navigation can tell it has been replaced. */
   private readonly commitTimes = new WeakMap<Frame, number>();
 
@@ -921,7 +923,54 @@ export class BrowserContextRouter {
       throw error;
     }
     this.watchBlocks(profile, context);
+    const first = context.pages()[0];
+    if (first) {
+      this.firstPages.set(profile, first);
+    }
     return context;
+  }
+
+  /**
+   * Closes the tabs a disconnected session opened: `owned` plus any popup
+   * those pages opened. The profile's first page, and every page that is
+   * neither, are left alone, and so is the browser. A browser that is gone or
+   * a page that will not close is logged and skipped, never thrown.
+   */
+  async closeSessionPages(profile: string, owned: Page[]): Promise<void> {
+    const context = this.runningContexts.get(profile);
+    if (!context || owned.length === 0) {
+      return;
+    }
+    try {
+      const first = this.firstPages.get(profile);
+      const doomed = new Set<Page>();
+      for (const page of context.pages()) {
+        if (page === first || page.isClosed()) {
+          continue;
+        }
+        if (owned.includes(page)) {
+          doomed.add(page);
+          continue;
+        }
+        for (const ancestor of owned) {
+          if (await openedBy(page, ancestor)) {
+            doomed.add(page);
+            break;
+          }
+        }
+      }
+      for (const page of doomed) {
+        await page.close().catch((error: unknown) => {
+          this.log(
+            `could not close session tab: profile=${profile} ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+      }
+    } catch (error) {
+      this.log(
+        `could not close session tabs: profile=${profile} ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 }
 
@@ -950,6 +999,8 @@ export class BrowserSession {
   private readonly connections = new Map<string, Promise<UpstreamConnection>>();
   /** The router generation each cached connection was opened at (see `BrowserContextRouter.generationOf`). */
   private readonly connectionGenerations = new Map<string, number>();
+  /** The tabs this session opened, per profile; closed when the session ends. */
+  private readonly ownedPages = new Map<string, Page[]>();
 
   constructor(private readonly router: BrowserContextRouter) {}
 
@@ -1015,12 +1066,16 @@ export class BrowserSession {
           arguments: { action: "new" },
         });
         connection.tabOpened = true;
+        await this.adoptCurrentPage(profile, connection);
       }
       const mark = this.router.blockMark(profile);
       const result = await connection.client.callTool({
         name,
         arguments: upstreamArgs,
       });
+      if (name === "browser_tabs" && upstreamArgs["action"] === "new") {
+        await this.adoptCurrentPage(profile, connection);
+      }
       const typed = result as { content: unknown[]; isError?: boolean };
       const content = absolutizeSnapshotLinks(typed.content);
       const allowedOrigins = this.router.currentAllowedOrigins(profile);
@@ -1089,6 +1144,28 @@ export class BrowserSession {
     } finally {
       this.router.endActivity(profile);
     }
+  }
+
+  /** Records this connection's current tab, just opened by it, as one the session owns. */
+  private async adoptCurrentPage(
+    profile: string,
+    connection: UpstreamConnection,
+  ): Promise<void> {
+    const page = await this.currentPage(profile, connection);
+    if (page) {
+      this.ownedPages.set(profile, [
+        ...(this.ownedPages.get(profile) ?? []),
+        page,
+      ]);
+    }
+  }
+
+  /** Closes the tabs this session opened (and their popups); called when its socket closes. */
+  async dispose(): Promise<void> {
+    for (const [profile, pages] of this.ownedPages) {
+      await this.router.closeSessionPages(profile, pages);
+    }
+    this.ownedPages.clear();
   }
 
   /**

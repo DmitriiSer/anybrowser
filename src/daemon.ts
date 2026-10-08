@@ -234,10 +234,17 @@ function startMcpSession(
     `session open (client version ${clientVersion}, sessions=${state.sessions.size})`,
   );
 
+  const browserSession = new BrowserSession(state.browserRouter);
   socket.on("close", () => {
     state.sessions.delete(socket);
     log(`session close (sessions=${state.sessions.size})`);
     armIdleExitTimer(state);
+    // Its tabs go with it; the browser stays (the daemon owns its lifetime).
+    browserSession.dispose().catch((error: unknown) => {
+      log(
+        `session tab cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   });
   // No 'error' listener here: attachHelloHandler already installed the one
   // permanent listener for this socket's whole life (see its comment), so
@@ -249,7 +256,6 @@ function startMcpSession(
       { name: "anybrowser", version: state.version },
       { capabilities: { tools: {} } },
     );
-    const browserSession = new BrowserSession(state.browserRouter);
 
     server.setRequestHandler(ListToolsRequestSchema, async () => {
       const browserTools = await browserSession.listTools();
