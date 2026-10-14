@@ -246,11 +246,11 @@ export class BrowserContextRouter {
    */
   private readonly activeCalls = new Map<string, number>();
   /**
-   * Bumped every time a profile's context is closed (idle-close or
-   * `closeAll`), so a `BrowserSession`'s cached embedded MCP connection for
-   * that profile (which is keyed on this generation) is dropped and
-   * recreated on the next call instead of reusing a connection bound to a
-   * now-closed context.
+   * Bumped every time a profile's context is closed (idle-close, `closeAll`,
+   * or the browser going away on its own), so a `BrowserSession`'s cached
+   * embedded MCP connection for that profile (which is keyed on this
+   * generation) is dropped and recreated on the next call instead of reusing
+   * a connection bound to a now-closed context.
    */
   private readonly generations = new Map<string, number>();
   /** The last allowed-sites list read for each profile, used if profile.json is unreadable mid-edit. */
@@ -362,21 +362,48 @@ export class BrowserContextRouter {
     if (!context) {
       return; // already closed by other means (e.g. daemon shutdown)
     }
-    this.clearIdleTimer(profile);
-    this.lastActivity.delete(profile);
     this.activeCalls.delete(profile);
-    this.contexts.delete(profile);
-    this.runningContexts.delete(profile);
-    this.runningHeadless.delete(profile);
-    this.bumpGeneration(profile);
-    const proxy = this.proxies.get(profile);
-    this.proxies.delete(profile);
+    const proxy = this.forgetRunning(profile);
     const closed = await this.closeOneContext(
       profile,
       context,
       PER_CONTEXT_CLOSE_TIMEOUT_MS,
     );
     await this.releaseProxy(profile, proxy, closed);
+  }
+
+  /**
+   * A profile's browser closed without the daemon closing it: the user quit
+   * it, it crashed, or it was killed. The daemon's own closes evict the
+   * profile before closing, and a newer launch replaces the cached context,
+   * so a close event for anything but the cached context is ignored.
+   */
+  private onContextClosed(profile: string, context: BrowserContext): void {
+    if (this.runningContexts.get(profile) !== context) {
+      return;
+    }
+    this.log(`browser closed unexpectedly: profile=${profile}`);
+    void this.releaseProxy(profile, this.forgetRunning(profile), true);
+  }
+
+  /**
+   * Drops what the router keeps for `profile`'s running browser, so the next
+   * tool call naming it launches a fresh one and every session reconnects
+   * (the generation bump). Returns the profile's proxy, for the caller to
+   * release once it knows whether the browser is gone. In-flight call counts
+   * are left alone: those calls still end and balance them.
+   */
+  private forgetRunning(profile: string): SiteProxy | undefined {
+    this.clearIdleTimer(profile);
+    this.lastActivity.delete(profile);
+    this.contexts.delete(profile);
+    this.runningContexts.delete(profile);
+    this.runningHeadless.delete(profile);
+    this.firstPages.delete(profile);
+    this.bumpGeneration(profile);
+    const proxy = this.proxies.get(profile);
+    this.proxies.delete(profile);
+    return proxy;
   }
 
   /**
@@ -455,6 +482,9 @@ export class BrowserContextRouter {
    * `headless` flag for a first launch (used by `loginLaunch`, decision 12:
    * a human must see the login window). Ignored once the profile is already
    * running.
+   *
+   * A browser that goes away on its own is evicted too (`onContextClosed`),
+   * so the next call launches a fresh one instead of reusing a dead context.
    */
   getContext(
     profile: string,
@@ -465,6 +495,7 @@ export class BrowserContextRouter {
       launching = this.launch(profile, headlessOverride)
         .then((context) => {
           this.runningContexts.set(profile, context);
+          context.once("close", () => this.onContextClosed(profile, context));
           return context;
         })
         .catch((error: unknown) => {
@@ -726,6 +757,9 @@ export class BrowserContextRouter {
    */
   async closeAll(): Promise<void> {
     const entries = [...this.runningContexts.entries()];
+    // Evicted before closing, so their close events are not taken for a
+    // browser that went away on its own.
+    this.runningContexts.clear();
     const OVERALL_CAP_MS = 10000;
     const overallDeadline = Date.now() + OVERALL_CAP_MS;
 
@@ -748,7 +782,6 @@ export class BrowserContextRouter {
     );
 
     this.contexts.clear();
-    this.runningContexts.clear();
     this.runningHeadless.clear();
     this.lastActivity.clear();
   }
@@ -1204,10 +1237,11 @@ export class BrowserSession {
   }
 
   private getConnection(profile: string): Promise<UpstreamConnection> {
-    // A profile idle-closed (or closed by daemon shutdown) since this
-    // connection was opened bumps its generation at the router: drop the
-    // stale connection (bound to a now-closed context) so the call below
-    // opens a fresh one over the profile's freshly relaunched context.
+    // A profile idle-closed (or closed by daemon shutdown, or whose browser
+    // went away on its own) since this connection was opened bumps its
+    // generation at the router: drop the stale connection (bound to a
+    // now-closed context) so the call below opens a fresh one over the
+    // profile's freshly relaunched context.
     const currentGeneration = this.router.generationOf(profile);
     if (this.connectionGenerations.get(profile) !== currentGeneration) {
       this.connections.delete(profile);
