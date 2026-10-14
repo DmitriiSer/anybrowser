@@ -1010,8 +1010,12 @@ export class BrowserContextRouter {
 /** One embedded `@playwright/mcp` connection for a single (session, profile) pair. */
 interface UpstreamConnection {
   client: Client;
-  /** Whether this connection has already opened its own fresh tab (decision 10). */
-  tabOpened: boolean;
+  /**
+   * The tab this session last chose to be on, by opening or selecting it
+   * (decision 10). Undefined until the daemon has opened the session's first
+   * tab; null when the tab list did not say which tab is current.
+   */
+  current?: Page | null;
   /**
    * The ledger position up to which this session has already been told about
    * refused subresources. A page keeps loading between calls, so what a call
@@ -1087,19 +1091,8 @@ export class BrowserSession {
     this.router.beginActivity(profile);
     try {
       const connection = await this.getConnection(profile);
-      if (!connection.tabOpened) {
-        // Every new embedded connection starts on the shared context's
-        // FIRST page (verified in the design spike), so without this, two
-        // sessions would share one tab and overwrite each other's
-        // navigation. Opening a fresh tab through the upstream tool surface
-        // (rather than touching Playwright directly) keeps upstream's own
-        // "current tab" bookkeeping correct (decision 10).
-        await connection.client.callTool({
-          name: "browser_tabs",
-          arguments: { action: "new" },
-        });
-        connection.tabOpened = true;
-        await this.adoptCurrentPage(profile, connection);
+      if (connection.current === undefined || connection.current?.isClosed()) {
+        await this.takeOwnTab(profile, connection);
       }
       const mark = this.router.blockMark(profile);
       const result = await connection.client.callTool({
@@ -1108,6 +1101,11 @@ export class BrowserSession {
       });
       if (name === "browser_tabs" && upstreamArgs["action"] === "new") {
         await this.adoptCurrentPage(profile, connection);
+      } else if (
+        name === "browser_tabs" &&
+        upstreamArgs["action"] === "select"
+      ) {
+        connection.current = await this.currentPage(profile, connection);
       }
       const typed = result as { content: unknown[]; isError?: boolean };
       const content = absolutizeSnapshotLinks(typed.content);
@@ -1179,12 +1177,45 @@ export class BrowserSession {
     }
   }
 
+  /**
+   * Puts this connection on a tab the session opened (decision 10): the most
+   * recent one still open, else a fresh one. Upstream starts every connection
+   * on the shared context's FIRST page (verified in the design spike), and
+   * when a connection's current tab closes it moves that connection to a
+   * neighbouring tab; either may be another session's. Both moves go through
+   * the upstream tool surface (rather than touching Playwright directly) so
+   * upstream's own "current tab" bookkeeping stays correct.
+   */
+  private async takeOwnTab(
+    profile: string,
+    connection: UpstreamConnection,
+  ): Promise<void> {
+    const pages = this.router.runningContext(profile)?.pages() ?? [];
+    const owned = (this.ownedPages.get(profile) ?? [])
+      .filter((page) => pages.includes(page))
+      .at(-1);
+    if (owned !== undefined) {
+      await connection.client.callTool({
+        name: "browser_tabs",
+        arguments: { action: "select", index: pages.indexOf(owned) },
+      });
+      connection.current = owned;
+      return;
+    }
+    await connection.client.callTool({
+      name: "browser_tabs",
+      arguments: { action: "new" },
+    });
+    await this.adoptCurrentPage(profile, connection);
+  }
+
   /** Records this connection's current tab, just opened by it, as one the session owns. */
   private async adoptCurrentPage(
     profile: string,
     connection: UpstreamConnection,
   ): Promise<void> {
     const page = await this.currentPage(profile, connection);
+    connection.current = page;
     if (page) {
       this.ownedPages.set(profile, [
         ...(this.ownedPages.get(profile) ?? []),
@@ -1276,6 +1307,6 @@ export class BrowserSession {
     await server.connect(serverTransport);
     const client = new Client({ name: "anybrowser-daemon", version: "0.0.0" });
     await client.connect(clientTransport);
-    return { client, tabOpened: false };
+    return { client };
   }
 }

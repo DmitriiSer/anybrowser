@@ -18,6 +18,7 @@ const SPAWN_TIMEOUT = 30000;
 const PAGES: Record<string, string> = {
   "/a": "<title>Tab A</title><h1>Page A</h1>",
   "/b": "<title>Tab B</title><h1>Page B</h1>",
+  "/c": "<title>Tab C</title><h1>Page C</h1>",
 };
 
 interface TestPageServer {
@@ -69,6 +70,42 @@ async function tabList(session: ConnectedClient): Promise<string> {
     await session.client.callTool({
       name: "browser_tabs",
       arguments: { profile: PROFILE, action: "list" },
+    }),
+  );
+}
+
+/** The index `browser_tabs list` gives the tab titled `title`. */
+async function tabIndex(
+  session: ConnectedClient,
+  title: string,
+): Promise<number> {
+  const list = await tabList(session);
+  const index = new RegExp(
+    `^- (\\d+):(?: \\(current\\))? \\[${title}\\]`,
+    "m",
+  ).exec(list)?.[1];
+  if (index === undefined) {
+    throw new Error(`no tab titled '${title}' in:\n${list}`);
+  }
+  return Number(index);
+}
+
+async function closeTab(
+  session: ConnectedClient,
+  index: number,
+): Promise<void> {
+  const result = await session.client.callTool({
+    name: "browser_tabs",
+    arguments: { profile: PROFILE, action: "close", index },
+  });
+  expect(result.isError, textOf(result)).toBeFalsy();
+}
+
+async function snapshotOf(session: ConnectedClient): Promise<string> {
+  return textOf(
+    await session.client.callTool({
+      name: "browser_snapshot",
+      arguments: { profile: PROFILE },
     }),
   );
 }
@@ -284,6 +321,97 @@ describe("a session's tabs go with it", () => {
 
       await waitFor(async () => (await tabCount(b)) === 2);
       expect(await tabList(b)).not.toContain("Tab A");
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("a session whose current tab closes", () => {
+  it(
+    "does not drive another session's tab afterwards",
+    async () => {
+      const a = await connect();
+      const b = await connect();
+      await navigate(a, `${pageServer.url}/a`);
+      await navigate(b, `${pageServer.url}/b`);
+      await closeTab(b, await tabIndex(b, "Tab A"));
+
+      await navigate(a, `${pageServer.url}/c`);
+
+      expect(await snapshotOf(b)).toContain("Page B");
+      expect(await snapshotOf(a)).toContain("Page C");
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "is not handed another session's new tab after every tab closed",
+    async () => {
+      const a = await connect();
+      const b = await connect();
+      await navigate(a, `${pageServer.url}/a`);
+      await navigate(b, `${pageServer.url}/b`);
+      for (let open = await tabCount(b); open > 0; open--) {
+        await closeTab(b, 0);
+      }
+
+      await navigate(a, `${pageServer.url}/c`);
+      await navigate(b, `${pageServer.url}/b`);
+
+      expect(await snapshotOf(a)).toContain("Page C");
+      expect(await snapshotOf(b)).toContain("Page B");
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "goes back to another tab it opened rather than opening a new one",
+    async () => {
+      const a = await connect();
+      const b = await connect();
+      await navigate(a, `${pageServer.url}/a`);
+      await navigate(b, `${pageServer.url}/b`);
+      await a.client.callTool({
+        name: "browser_tabs",
+        arguments: { profile: PROFILE, action: "new" },
+      });
+      await navigate(a, `${pageServer.url}/c`);
+      await closeTab(b, await tabIndex(b, "Tab C"));
+
+      expect(await snapshotOf(a)).toContain("Page A");
+      expect(await snapshotOf(b)).toContain("Page B");
+      expect(await tabCount(b)).toBe(3);
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "stays on another session's tab it selected, and goes back to its own when that tab closes",
+    async () => {
+      const a = await connect();
+      const b = await connect();
+      await navigate(a, `${pageServer.url}/a`);
+      await navigate(b, `${pageServer.url}/b`);
+      await b.client.callTool({
+        name: "browser_tabs",
+        arguments: { profile: PROFILE, action: "new" },
+      });
+      await navigate(b, `${pageServer.url}/c`);
+      const selected = await a.client.callTool({
+        name: "browser_tabs",
+        arguments: {
+          profile: PROFILE,
+          action: "select",
+          index: await tabIndex(a, "Tab B"),
+        },
+      });
+      expect(selected.isError, textOf(selected)).toBeFalsy();
+      expect(await snapshotOf(a)).toContain("Page B");
+
+      await closeTab(b, await tabIndex(b, "Tab B"));
+
+      expect(await snapshotOf(a)).toContain("Page A");
+      expect(await snapshotOf(b)).toContain("Page C");
     },
     SPAWN_TIMEOUT,
   );
