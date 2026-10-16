@@ -1,6 +1,6 @@
 # anybrowser: Design
 
-Status: agreed 2026-09-17. Decisions came out of a design interview; each one records the choice and the reason so it can be revisited on purpose, not by accident.
+Status: agreed 2026-09-17, updated 2026-10-15 to match what was built. Decisions came out of a design interview; each one records the choice and the reason so it can be revisited on purpose, not by accident. Where the build departed from a decision, the decision says so.
 
 ## Goal
 
@@ -23,7 +23,7 @@ The starting point was a small single-site fetch script: it existed because plai
 
 3. **MCP server plus a CLI.** The agent uses MCP tools (screenshots come back as images, inputs are typed). Profile management is rare, so it gets a CLI and is also exposed as MCP tools so the agent can offer to open a login page. No desktop app.
 
-4. **Three engines in v1.** Chromium-family browsers use the installed binary (Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, auto-detected) with Playwright's Chromium as fallback. Firefox and WebKit always use Playwright's bundled builds, downloaded on first use. All engines launch through `launchPersistentContext`, so there is one launch path and no debug-port juggling.
+4. **Three engines in v1.** Chromium-family browsers use the installed binary (Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, auto-detected) with Playwright's Chromium as fallback. Firefox and WebKit always use Playwright's bundled builds, downloaded on first use. All engines launch through `launchPersistentContext`, so there is one launch path and no debug-port juggling. Not built yet: Firefox and WebKit are rejected at profile creation, and installed-browser detection covers macOS only.
 
 5. **Daemon owns the browsers.** One daemon per user holds every open profile's browser. Any agent session can use any profile, with many tabs. The daemon exits after `idleMinutes` (default 10) without tool calls; each profile's browser closes after the same idle period on its own. RAM cost is roughly 150-300 MB per open profile plus 50-150 MB per tab.
 
@@ -42,13 +42,15 @@ The starting point was a small single-site fetch script: it existed because plai
 
 11. **Node/TypeScript.** Forced by decision 9. Go would add a hop, not remove one, since playwright-go spawns the Node driver anyway. Time goes to page loads and model turns, not to the orchestration layer.
 
-12. **Login flow has no site knowledge.** `profile_login(profile, url)` opens the URL in a headed window, brings it to front, returns. The agent asks the user to log in, then verifies with a snapshot. It detects that a login is needed the same way: it sees a login form. If the profile is headless, `profile_login` relaunches it headed for that session.
+12. **Login flow has no site knowledge.** `profile_login(profile, url)` opens the URL in a headed window, brings it to front, returns. The agent asks the user to log in, then verifies with a snapshot. It detects that a login is needed the same way: it sees a login form. If the profile is already running headless, `profile_login` refuses with a clear error instead of relaunching it, because relaunching would break other sessions' live tabs; the user stops the daemon and retries.
 
 13. **Every tool takes a required `profile` argument.** Stateless and explicit, like `tabId` in Claude in Chrome. About 8 tokens per call.
 
-14. **Tool surface.** Playwright MCP's core tools plus `vision`, passed through under their upstream names with `profile` added. Removed: `browser_close` (the daemon owns browser lifetime; upstream it also reports closing a page it does not close when the context is supplied, and `sharedBrowserContext: true` makes it refuse instead) and `browser_install` (the launcher handles downloads). Upstream schemas set `additionalProperties: false`, so the router adds `profile` to each schema and strips it before forwarding. Added: `profile_list`, `profile_create(name, browser, headless?)`, `profile_delete`, `profile_login(profile, url)`, `profile_status`, `daemon_status`.
+14. **Tool surface.** Playwright MCP's core tools plus `vision`, passed through under their upstream names with `profile` added. Removed: `browser_close` (the daemon owns browser lifetime; upstream it also reports closing a page it does not close when the context is supplied, and `sharedBrowserContext: true` makes it refuse instead) and `browser_install` (the launcher handles downloads). Upstream schemas set `additionalProperties: false`, so the router adds `profile` to each schema and strips it before forwarding. Added: `profile_list`, `profile_create(name, browser, headless?)`, `profile_login(profile, url)`, `profile_status`, `daemon_status`. Deliberately not added: `profile_delete` (deleting destroys logins, so it stays a human CLI action) and any tool that changes `headless` or the allowed-sites list.
 
-15. **Safety, three layers.** Profile isolation; optional `allowedOrigins` per profile (Playwright MCP implements it, off by default); a skill rule to confirm before irreversible actions (post, send, buy, delete, change settings).
+15. **Safety, three layers.** Profile isolation; an optional allowed-sites list per profile; a skill rule to confirm before irreversible actions (post, send, buy, delete, change settings).
+
+    The list is enforced by a small HTTP/CONNECT forward proxy inside the daemon, one loopback listener per running profile, passed to the browser as its proxy with no credentials. There are no `context.route` handlers at all. Three attempts with routes, including upstream's own `network.allowedOrigins`, failed review: a route never sees a redirect hop; following redirects ourselves served pages under the wrong URL and sent one site's cookies to another; responses were buffered, so streaming broke; and any route makes Playwright disable the browser cache, and can be removed by the agent from inside the page. Through a proxy the browser follows redirects itself, every hop and WebSocket is checked, nothing is buffered, and the cache stays on. The check is by host and port, so HTTPS paths are invisible to it. The proxy's own refusal record decides whether something was blocked; Playwright events only say which URL and which page. Not covered: WebRTC, and an agent with shell access, which can edit `profile.json`.
 
 16. **On-disk layout.**
 
@@ -66,9 +68,11 @@ The starting point was a small single-site fetch script: it existed because plai
 
     `browser` is one of `chrome`, `chromium`, `brave`, `edge`, `arc`, `vivaldi`, `opera`, `firefox`, `webkit`. The resolved executable path is stored at create time so a later rename or uninstall fails loudly.
 
-17. **Wire protocol is MCP over a Unix socket.** The daemon runs an MCP server on the socket with newline-delimited JSON-RPC. The per-session stdio proxy pipes stdin/stdout to the socket, spawns the daemon if absent, and sends its package version on connect. A daemon of a different version finishes serving and exits when idle, so `npm update` takes effect without a manual stop. One socket connection equals one session.
+17. **Wire protocol is MCP over a Unix socket.** The daemon runs an MCP server on the socket with newline-delimited JSON-RPC. The per-session stdio proxy pipes stdin/stdout to the socket, spawns the daemon if absent, and sends its package version on connect. Not built yet: the version is recorded per session, but a daemon of a different version does not yet retire itself, so after an update the user runs `anyb stop`. One socket connection equals one session.
 
-18. **Distribution.** npm package `anybrowser`, binary `anyb`. Subcommands: `anyb mcp` (stdio proxy), `anyb daemon` (internal), `anyb profile list|add|remove|login|set`, `anyb status`, `anyb stop`, `anyb install`, `anyb uninstall`. Install paths, in order of preference:
+18. **Distribution.** As built: `anyb install` supports Claude Code only, and it registers the server by running `claude mcp add --scope user anybrowser -- anyb mcp`, never by editing the host's config file, because that file holds all of the host's state and its format is the host's. It copies the skill into `~/.claude/skills/anybrowser/` and refuses to overwrite a different file there without `--force`. `--print` gives a generic snippet for every other host. Host detection, `--host`, and the plugin below are not built; each further host should be added through its own CLI where one exists. The original plan follows.
+
+    npm package `anybrowser`, binary `anyb`. Subcommands: `anyb mcp` (stdio proxy), `anyb daemon` (internal), `anyb profile list|add|remove|login|set`, `anyb status`, `anyb stop`, `anyb install`, `anyb uninstall`. Install paths, in order of preference:
 
     - `npx anybrowser install` is the universal path. With no flags it detects which MCP hosts are present and offers each. The flag `--host claude|codex|cursor|gemini|claude-desktop` picks one without prompting. Per host it registers the MCP server and copies the skill into that host's skills directory where the host has one. The server command is always `npx -y anybrowser mcp`; only the config file and format differ. `--print` outputs a generic MCP config snippet for any host not on the list. `anyb uninstall` reverses an install.
     - Host-native packaging where a host has it, as a convenience on top of the above. The first is a Claude Code plugin, a `plugin.json` under `.claude-plugin/` that bundles the MCP server and the skill. Install it with `/plugin marketplace add DmitriiSer/anybrowser` and then `/plugin install anybrowser`. Others follow when their hosts grow an equivalent.
@@ -78,7 +82,7 @@ The starting point was a small single-site fetch script: it existed because plai
 
     macOS first; Linux is a detection path table away; Windows later. Playwright engine downloads happen on first use with a progress message returned to the agent.
 
-19. **Testing.** Unit (vitest): naming and config, browser detection against a fake filesystem, lock and stale-socket logic. Integration, on Playwright's Chromium against a locally served page: spawn race (20 proxies, one daemon), per-session current tab, idle shutdown with seconds-scale `idleMinutes`, version-mismatch restart, `profile_login` relaunching headed. No tests against real sites; manual smoke test with a real profile at the end. Daemon lifecycle tests are written first.
+19. **Testing.** Unit (vitest): naming and config, browser detection against a fake filesystem, lock and stale-socket logic. Integration, on Playwright's Chromium against a locally served page: spawn race (20 proxies, one daemon), per-session current tab, idle shutdown with a millisecond-scale `ANYBROWSER_IDLE_MS`, cookie survival across shutdown, and the allowed-sites proxy, including a local HTTPS origin trusted through a test-only certificate hash. No tests against real sites; manual smoke test with a real profile at the end. Daemon lifecycle tests are written first.
 
 20. **Skill plus MCP, not skill instead of MCP.** Some hosts, Claude Code among them, defer MCP tool schemas (only names sit in context until first use), so the token argument for a skill-only design is weak, and a skill cannot return images. The skill carries the playbook: snapshot before screenshot, open your own tab, confirm irreversible actions, how login works.
 
@@ -94,6 +98,7 @@ Agent session A                Agent session B
                   v
             anyb daemon (one per user, idle-exits)
               |  profile router: required `profile` arg on every tool
+              |  one allowed-sites proxy per running profile
               |
               +-- reddit-in-chrome  : persistent context (Chrome, headed)
               |     +-- playwright-mcp connection for session A
@@ -104,10 +109,10 @@ Agent session A                Agent session B
 
 ## Build order
 
-1. Walking skeleton: daemon on the socket, stdio proxy, one hard-coded profile on Playwright's Chromium, tools passed through with `profile`.
-2. Profiles: `profile.json`, browser detection, `profile_*` tools and CLI, headed login flow, Firefox and WebKit engines.
-3. Hardening: spawn race, idle shutdown, version handshake, `allowedOrigins`, the integration tests.
-4. Ship: skill, `anyb install` with host adapters, Claude Code plugin manifest, README, npm publish.
+1. Walking skeleton: done.
+2. Profiles: done for Chromium-family browsers. Firefox and WebKit not started.
+3. Hardening: done except the version handshake.
+4. Ship: skill and `anyb install` for Claude Code done; other hosts, the plugin manifest and npm publish not started.
 
 ## Spike: shared context across sessions
 
