@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { connectOnce, ensureDaemon } from "./connect.js";
 import { runDaemon } from "./daemon.js";
 import { formatHelloLine, type DaemonStatus } from "./hello.js";
+import { runInstallCommand, runUninstallCommand } from "./install.js";
 import { resolvePaths } from "./paths.js";
 import {
   addProfileWithDetection,
@@ -25,6 +26,8 @@ commands:
   daemon     run the daemon in the foreground (internal; use 'mcp' instead)
   status     print daemon status without starting it
   stop       stop the daemon if it is running
+  install    register anybrowser and its skill with Claude Code (--print for other hosts)
+  uninstall  remove that registration and the skill
   profile    create and manage browser profiles (see below)
 
 profile subcommands:
@@ -398,6 +401,12 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === "stop") {
     return runStopCommand();
+  }
+  if (command === "install") {
+    return runInstallCommand(argv.slice(1));
+  }
+  if (command === "uninstall") {
+    return runUninstallCommand();
   }
   if (command === "profile") {
     return await runProfileCommand(argv.slice(1));

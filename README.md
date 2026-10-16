@@ -35,10 +35,10 @@ anyb stop     # stop the daemon
 Add it to an agent host. For Claude Code:
 
 ```
-claude mcp add --scope user anybrowser -- anyb mcp
+anyb install      # registers the MCP server and copies the skill; `anyb uninstall` reverses it
 ```
 
-For any other MCP host, register a stdio server with this command:
+For any other MCP host, `anyb install --print` prints a config snippet, or register a stdio server with this command:
 
 ```json
 { "command": "anyb", "args": ["mcp"] }
