@@ -27,7 +27,7 @@ agent session ─┘  (stdio)      (one per user)    ├─ work-in-chrome
 
 ## Status
 
-Pre-release, not on npm yet. What works: profiles on installed Chromium browsers, login by hand, every Playwright MCP browser tool, shared sessions, idle shutdown, the allowed-sites list, and `anyb install` for Claude Code.
+Pre-release, version 0.1. What works: profiles on installed Chromium browsers, login by hand, every Playwright MCP browser tool, shared sessions, idle shutdown, the allowed-sites list, and `anyb install` for Claude Code.
 
 Not yet: Firefox and WebKit, installed-browser detection outside macOS (Playwright's Chromium works everywhere), and `anyb install` for hosts other than Claude Code.
 
@@ -36,15 +36,11 @@ Not yet: Firefox and WebKit, installed-browser detection outside macOS (Playwrig
 You need Node 22.12 or newer.
 
 ```
-git clone https://github.com/DmitriiSer/anybrowser.git
-cd anybrowser
-npm install
-npm run build
-npm link
+npm install -g anybrowser
 anyb install
 ```
 
-`anyb install` registers the MCP server with Claude Code and copies the agent skill. For any other MCP host, `anyb install --print` prints a config snippet to paste.
+Install it globally: your agent host runs the `anyb` command, so it has to be on your `PATH`. `anyb install` registers the MCP server with Claude Code and copies the agent skill. For any other MCP host, `anyb install --print` prints a config snippet to paste.
 
 Make a profile and sign in to it once:
 
@@ -66,6 +62,8 @@ An agent in a logged-in browser can do real things, so the design limits how far
 ## Development
 
 Work is test-first: a failing test, then the code that makes it pass. `CLAUDE.md` has the rules, and `docs/DESIGN.md` records each design decision and why.
+
+To run from source, clone the repository, then `npm install`, `npm run build` and `npm link`, which puts your build on your `PATH` as `anyb`.
 
 ```
 npx playwright install chromium   # once, for the browser tests

@@ -1,6 +1,6 @@
 {
   "name": "anybrowser",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Let any LLM agent drive a real, logged-in browser over MCP. No browser extension required.",
   "license": "MIT",
   "repository": "github:DmitriiSer/anybrowser",
@@ -32,7 +32,8 @@
     "test:unit": "npm run build && vitest run --config vitest.unit.config.ts",
     "test:browser": "npm run build && vitest run --config vitest.browser.config.ts",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run typecheck && npm run test:unit && npm run format:check"
   },
   "devDependencies": {
     "@types/node": "^22.20.3",
@@ -42,6 +43,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
-    "@playwright/mcp": "0.0.81"
+    "@playwright/mcp": "0.0.81",
+    "playwright": "1.64.0-alpha-2026-09-14"
   }
 }
