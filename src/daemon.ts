@@ -130,6 +130,10 @@ interface DaemonState {
   sessions: Set<Socket>;
   server: NetServer;
   shuttingDown: boolean;
+  /** Set when a client of a different version connects; see retireIfOutdated. */
+  retiring: boolean;
+  /** The differing client version that triggered retirement, for the exit log line. */
+  retiredFor: string | undefined;
   browserRouter: BrowserContextRouter;
   /** Resolved once at daemon startup (src/idle.ts); null means idling is disabled. */
   idleMs: number | null;
@@ -149,6 +153,7 @@ function buildStatus(state: DaemonState): DaemonStatus {
     sessions: state.sessions.size,
     profiles: state.browserRouter.runningProfileIds(),
     idleMs: state.idleMs,
+    retiring: state.retiring,
   };
 }
 
@@ -230,6 +235,13 @@ function startMcpSession(
 ): void {
   state.sessions.add(socket);
   clearIdleExitTimer(state);
+  if (clientVersion !== state.version && !state.retiring) {
+    state.retiring = true;
+    state.retiredFor = clientVersion;
+    log(
+      `retiring: client version ${clientVersion} differs from daemon version ${state.version}; exiting once the last session ends`,
+    );
+  }
   log(
     `session open (client version ${clientVersion}, sessions=${state.sessions.size})`,
   );
@@ -238,6 +250,12 @@ function startMcpSession(
   socket.on("close", () => {
     state.sessions.delete(socket);
     log(`session close (sessions=${state.sessions.size})`);
+    if (state.retiring && state.sessions.size === 0 && !state.shuttingDown) {
+      log(
+        `retiring: exiting, no sessions left (daemon version ${state.version}, client version ${state.retiredFor})`,
+      );
+      void shutdown(state, 0);
+    }
     armIdleExitTimer(state);
     // Its tabs go with it; the browser stays (the daemon owns its lifetime).
     browserSession.dispose().catch((error: unknown) => {
@@ -570,6 +588,8 @@ export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
     sessions: new Set(),
     server,
     shuttingDown: false,
+    retiring: false,
+    retiredFor: undefined,
     browserRouter: new BrowserContextRouter(paths, log, idleMs),
     idleMs,
     idleExitTimer: undefined,

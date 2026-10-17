@@ -225,6 +225,7 @@ export async function daemonStatusFrom(client: Client): Promise<{
   sessions: number;
   profiles: unknown[];
   idleMs: number | null;
+  retiring: boolean;
 }> {
   const result = await client.callTool({
     name: "daemon_status",
@@ -242,6 +243,7 @@ export async function daemonStatusFrom(client: Client): Promise<{
     sessions: number;
     profiles: unknown[];
     idleMs: number | null;
+    retiring: boolean;
   };
 }
 

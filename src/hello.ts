@@ -29,6 +29,8 @@ export interface DaemonStatus {
   profiles: unknown[];
   /** Resolved idle timeout in ms (src/idle.ts), or null when idling is disabled. */
   idleMs: number | null;
+  /** True once a client of a different version connected: the daemon exits when its last session ends. */
+  retiring: boolean;
 }
 
 export function isHelloRole(value: unknown): value is HelloRole {

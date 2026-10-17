@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   closeSync,
   mkdirSync,
   openSync,
@@ -11,6 +12,7 @@ import {
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { fileURLToPath } from "node:url";
+import { formatHelloLine, type DaemonStatus } from "./hello.js";
 import { assertSocketPathFits, type AnybrowserPaths } from "./paths.js";
 
 const DEFAULT_SPAWN_WAIT_MS = 10000;
@@ -225,4 +227,74 @@ export async function ensureDaemon(
     `anyb: could not connect to or start the daemon within ${deadlineMs}ms. ` +
       `Check the log at ${displayLogPath(paths)}`,
   );
+}
+
+const REPLACE_WAIT_MS = 5000;
+
+/** Reads one newline-terminated line from `socket`; null if it ends first or `timeoutMs` passes. */
+function readReplyLine(
+  socket: Socket,
+  timeoutMs: number,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    let buffered = "";
+    const finish = (value: string | null) => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("close", onEnd);
+      socket.off("error", onEnd);
+      resolve(value);
+    };
+    const onData = (chunk: Buffer) => {
+      buffered += chunk.toString("utf8");
+      const newline = buffered.indexOf("\n");
+      if (newline !== -1) finish(buffered.slice(0, newline));
+    };
+    const onEnd = () => finish(null);
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    socket.on("data", onData);
+    socket.on("close", onEnd);
+    socket.on("error", onEnd);
+  });
+}
+
+/**
+ * Version handshake (docs/DESIGN.md decision 17). If a daemon is running
+ * with a different version than `version` and no session is using it, asks
+ * it to stop and waits (bounded) for its socket file to disappear, so the
+ * normal spawn path then starts a daemon of the new version. A daemon that
+ * still has sessions is left alone: it retires itself once they are gone.
+ * Never throws and never writes to stdout.
+ */
+export async function replaceStaleDaemon(
+  paths: AnybrowserPaths,
+  version: string,
+): Promise<void> {
+  const probe = await connectOnce(paths.socket);
+  if (!probe) return;
+  probe.on("error", () => {});
+  probe.write(formatHelloLine("status", version));
+  const line = await readReplyLine(probe, REPLACE_WAIT_MS);
+  probe.destroy();
+  if (line === null) return;
+
+  let status: DaemonStatus;
+  try {
+    status = JSON.parse(line) as DaemonStatus;
+  } catch {
+    return;
+  }
+  if (status.version === version || status.sessions > 0) return;
+
+  const stopper = await connectOnce(paths.socket);
+  if (!stopper) return;
+  stopper.on("error", () => {});
+  stopper.write(formatHelloLine("stop", version));
+  await readReplyLine(stopper, REPLACE_WAIT_MS);
+  stopper.destroy();
+
+  const deadline = Date.now() + REPLACE_WAIT_MS;
+  while (existsSync(paths.socket) && Date.now() < deadline) {
+    await delay(50);
+  }
 }

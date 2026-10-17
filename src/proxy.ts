@@ -1,4 +1,4 @@
-import { ensureDaemon } from "./connect.js";
+import { ensureDaemon, replaceStaleDaemon } from "./connect.js";
 import { formatHelloLine } from "./hello.js";
 import type { AnybrowserPaths } from "./paths.js";
 import { readVersion } from "./version.js";
@@ -12,6 +12,7 @@ import { readVersion } from "./version.js";
 export async function runProxy(paths: AnybrowserPaths): Promise<number> {
   let socket;
   try {
+    await replaceStaleDaemon(paths, readVersion());
     socket = await ensureDaemon(paths);
   } catch (error) {
     process.stderr.write(
