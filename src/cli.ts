@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import type { Socket } from "node:net";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { connectOnce, ensureDaemon } from "./connect.js";
-import { runDaemon } from "./daemon.js";
 import { formatHelloLine, type DaemonStatus } from "./hello.js";
 import { runInstallCommand, runUninstallCommand } from "./install.js";
 import { resolvePaths } from "./paths.js";
@@ -393,6 +392,9 @@ async function main(argv: string[]): Promise<number> {
     return runProxy(resolvePaths());
   }
   if (command === "daemon") {
+    // Imported here, not at the top: it pulls in Playwright, which every
+    // other command would otherwise pay for on startup.
+    const { runDaemon } = await import("./daemon.js");
     await runDaemon(resolvePaths());
     return 0;
   }
