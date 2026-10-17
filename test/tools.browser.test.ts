@@ -619,3 +619,121 @@ describe("bug B: browser_navigate's snapshot link is usable outside the daemon's
     SPAWN_TIMEOUT,
   );
 });
+
+/** Reads the single number a `browser_evaluate` call printed under "### Result". */
+function evaluatedNumber(result: {
+  content: Array<{ type: string; text?: string }>;
+}): number {
+  const match = snapshotText(result).match(/### Result\s+(-?\d+)/);
+  expect(match, snapshotText(result)).not.toBeNull();
+  return Number(match![1]);
+}
+
+describe("the page follows the browser window instead of a fixed emulated viewport", () => {
+  async function innerSize(
+    client: Awaited<ReturnType<typeof connectClient>>["client"],
+  ): Promise<{ width: number; height: number }> {
+    const call = (fn: string) =>
+      client.callTool({
+        name: "browser_evaluate",
+        arguments: { profile: "default-in-chromium", function: fn },
+      });
+    return {
+      width: evaluatedNumber((await call("() => window.innerWidth")) as never),
+      height: evaluatedNumber(
+        (await call("() => window.innerHeight")) as never,
+      ),
+    };
+  }
+
+  it(
+    "window.innerWidth tracks a launch --window-size rather than Playwright's default 1280",
+    async () => {
+      const pageServer = await startPageServer();
+      // Test-only seam: extra Chromium launch arguments, so a headless run can
+      // start with a window size that differs from Playwright's default
+      // emulated 1280x720 viewport.
+      const { client, close } = await connectClient(home, {
+        ANYBROWSER_TEST_CHROMIUM_ARGS: "--window-size=900,600",
+      });
+      try {
+        await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        const { width } = await innerSize(client);
+        expect(width).toBeLessThanOrEqual(900);
+        expect(width).toBeGreaterThan(600);
+      } finally {
+        await close();
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "browser_resize sets the size the page sees",
+    async () => {
+      const pageServer = await startPageServer();
+      const { client, close } = await connectClient(home);
+      try {
+        await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        const resized = await client.callTool({
+          name: "browser_resize",
+          arguments: {
+            profile: "default-in-chromium",
+            width: 700,
+            height: 500,
+          },
+        });
+        expect(resized.isError).toBeFalsy();
+        expect(await innerSize(client)).toEqual({ width: 700, height: 500 });
+      } finally {
+        await close();
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});
+
+describe("headless keeps a predictable default page size", () => {
+  it(
+    "reports a 1280x720 page when no window size is requested",
+    async () => {
+      const pageServer = await startPageServer();
+      const { client, close } = await connectClient(home);
+      try {
+        await client.callTool({
+          name: "browser_navigate",
+          arguments: {
+            profile: "default-in-chromium",
+            url: `${pageServer.url}/a`,
+          },
+        });
+        const size = await client.callTool({
+          name: "browser_evaluate",
+          arguments: {
+            profile: "default-in-chromium",
+            function: "() => window.innerWidth + 'x' + window.innerHeight",
+          },
+        });
+        expect(snapshotText(size as never)).toContain("1280x720");
+      } finally {
+        await close();
+        await pageServer.close();
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+});

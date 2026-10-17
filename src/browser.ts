@@ -922,16 +922,31 @@ export class BrowserContextRouter {
     // this value, so a test can serve HTTPS locally. It pins one key; it is
     // not a switch that turns certificate checking off.
     const trustedSpki = process.env["ANYBROWSER_TEST_TRUSTED_SPKI"];
+    // Test-only: extra Chromium launch arguments, whitespace-separated, so a
+    // headless test can start with a known window size.
+    const testArgs = (process.env["ANYBROWSER_TEST_CHROMIUM_ARGS"] ?? "")
+      .split(/\s+/)
+      .filter(Boolean);
     let context: BrowserContext;
     try {
       context = await chromium.launchPersistentContext(userDataDir, {
         headless,
+        // No emulated viewport: the page takes the real window's size, so a
+        // headed window can be resized and the page fills it. Playwright's
+        // default is a fixed 1280x720 box that ignores the window.
+        viewport: null,
         // No `bypass`: any loopback host there would switch off Chromium's
         // forced proxying of loopback, and local servers must be checked too.
         proxy: { server: `http://127.0.0.1:${proxy.port}` },
-        ...(trustedSpki
-          ? { args: [`--ignore-certificate-errors-spki-list=${trustedSpki}`] }
-          : {}),
+        args: [
+          // Headless has no real window to follow; give it the size Playwright
+          // used to emulate so snapshots and screenshots stay 1280x720.
+          ...(headless ? ["--window-size=1280,720"] : []),
+          ...(trustedSpki
+            ? [`--ignore-certificate-errors-spki-list=${trustedSpki}`]
+            : []),
+          ...testArgs,
+        ],
         // The daemon is the sole owner of browser lifetime (decision 5) and
         // already installs its own SIGINT/SIGTERM handlers (daemon.ts) that
         // close every context gracefully before exiting. Without these three
