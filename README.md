@@ -36,7 +36,7 @@ Not yet: Firefox and WebKit, installed-browser detection outside macOS (Playwrig
 You need Node 22.12 or newer.
 
 ```
-npm install -g anybrowser
+npm install -g @anybrowser/cli
 anyb install
 ```
 
