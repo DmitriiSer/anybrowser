@@ -24,6 +24,7 @@ import {
   makeMissingHome,
   packageVersion,
   runCli,
+  runCliAsync,
   socketExists,
   socketPathFor,
   waitFor,
@@ -630,6 +631,104 @@ describe("anyb stop", () => {
       const afterStop = runCli(["status"], home);
       expect(afterStop.status).toBe(1);
       expect(afterStop.stdout.trim()).toBe("not running");
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "returns only once the daemon has finished shutting down, so a daemon started right after it keeps its socket",
+    async () => {
+      // Test-only seam: this daemon takes 3 s to close its browsers, as a
+      // loaded machine can. Only the first daemon inherits it.
+      const first = await connectClient(home, {
+        ANYBROWSER_TEST_SHUTDOWN_DELAY_MS: "3000",
+      });
+      const firstPid = (await daemonStatusFrom(first.client)).pid;
+      await first.close();
+
+      expect(runCli(["stop"], home).status).toBe(0);
+
+      const second = await connectClient(home);
+      const secondPid = (await daemonStatusFrom(second.client)).pid;
+      try {
+        expect(secondPid).not.toBe(firstPid);
+        await waitFor(() => !isPidAlive(firstPid), { timeoutMs: 10000 });
+
+        // The first daemon finishing must not take the second one's socket
+        // with it, or nothing can reach the second daemon any more.
+        const status = runCli(["status"], home);
+        expect(status.status).toBe(0);
+        expect((JSON.parse(status.stdout) as { pid: number }).pid).toBe(
+          secondPid,
+        );
+      } finally {
+        await second.close();
+        // A daemon whose socket file is gone is out of reach of
+        // cleanupHome's 'anyb stop', so stop it by its pid.
+        if (isPidAlive(secondPid)) {
+          process.kill(secondPid, "SIGTERM");
+        }
+      }
+    },
+    SPAWN_TIMEOUT,
+  );
+
+  it(
+    "turns away a session that connects while the daemon is still closing its browsers",
+    async () => {
+      const warm = await connectClient(home, {
+        ANYBROWSER_TEST_SHUTDOWN_DELAY_MS: "3000",
+      });
+      await warm.close();
+
+      const stopping = runCliAsync(["stop"], home);
+      await waitFor(
+        () =>
+          readFileSync(logPathFor(home), "utf8").includes(
+            "stop: shutting down",
+          ),
+        { timeoutMs: 5000 },
+      );
+
+      const helloLine = `{"anybrowser":{"version":"0.0.0-test","role":"mcp"}}\n`;
+      const initializeRequest =
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: LATEST_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: { name: "anybrowser-raw-test-client", version: "0" },
+          },
+        }) + "\n";
+      // A served session answers the initialize request; a turned-away one
+      // is closed without a byte.
+      const reply = await new Promise<string>((resolve, reject) => {
+        const socket = createConnection(socketPathFor(home));
+        let buffered = "";
+        let connected = false;
+        socket.on("connect", () => {
+          connected = true;
+          socket.write(helloLine + initializeRequest);
+        });
+        socket.on("data", (chunk) => {
+          buffered += chunk.toString("utf8");
+          if (buffered.includes("\n")) {
+            socket.destroy();
+            resolve(buffered);
+          }
+        });
+        // Closed under a write, the client sees EPIPE or ECONNRESET: that
+        // is still no reply. Failing to connect at all is not.
+        socket.on("error", (error) =>
+          connected ? resolve(buffered) : reject(error),
+        );
+        socket.on("close", () => resolve(buffered));
+      });
+
+      expect(reply).toBe("");
+      expect((await stopping).status).toBe(0);
     },
     SPAWN_TIMEOUT,
   );

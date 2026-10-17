@@ -530,6 +530,18 @@ function attachHelloHandler(socket: Socket, state: DaemonState): void {
   socket.on("close", onClose);
 }
 
+/**
+ * Test-only seam: holds shutdown for ANYBROWSER_TEST_SHUTDOWN_DELAY_MS before
+ * the browsers are closed, standing in for browsers that are slow to close on
+ * a loaded machine. Never set outside tests.
+ */
+async function slowShutdownForTests(): Promise<void> {
+  const delayMs = Number(process.env["ANYBROWSER_TEST_SHUTDOWN_DELAY_MS"]);
+  if (Number.isFinite(delayMs) && delayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+}
+
 async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
   if (state.shuttingDown) {
     return;
@@ -538,7 +550,6 @@ async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
   clearIdleExitTimer(state);
   log("stop: shutting down");
 
-  state.server.close();
   for (const session of state.sessions) {
     session.destroy();
   }
@@ -550,15 +561,14 @@ async function shutdown(state: DaemonState, exitCode: number): Promise<void> {
   // cli.ts's runStopCommand), so the socket must not vanish until a script
   // that immediately inspects the profile directory afterwards sees a
   // flushed cookie store.
+  await slowShutdownForTests();
   await state.browserRouter.closeAll();
 
-  try {
-    unlinkSync(state.paths.socket);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      log(`stop: failed to remove socket: ${(error as Error).message}`);
-    }
-  }
+  // Closing the server is what removes the socket file (Node unlinks a Unix
+  // socket's path when its server closes), so it waits until the browsers
+  // are closed. There is no separate unlink afterwards: once the file is
+  // gone, a new daemon may already have bound the same path.
+  state.server.close();
 
   log("stop: done");
   process.exit(exitCode);
@@ -600,6 +610,12 @@ export async function runDaemon(paths: AnybrowserPaths): Promise<void> {
   armIdleExitTimer(state);
 
   server.on("connection", (socket) => {
+    // The server keeps listening while shutdown closes the browsers (see
+    // shutdown), but nothing new may start on a daemon that is going away.
+    if (state.shuttingDown) {
+      socket.destroy();
+      return;
+    }
     attachHelloHandler(socket, state);
   });
   server.on("error", (error) => {
