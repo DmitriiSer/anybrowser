@@ -1,6 +1,6 @@
 {
   "name": "@anybrowser/cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Let any LLM agent drive a real, logged-in browser over MCP. No browser extension required.",
   "license": "MIT",
   "repository": "github:DmitriiSer/anybrowser",
